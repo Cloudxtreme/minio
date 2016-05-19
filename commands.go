@@ -18,13 +18,26 @@ package main
 
 import "github.com/minio/cli"
 
-// Collection of minio commands currently supported are
+// Collection of minio commands currently supported are.
 var commands = []cli.Command{}
 
-// Collection of minio commands currently supported in a trie tree
+// Collection of minio commands currently supported in a trie tree.
 var commandsTree = newTrie()
 
-// registerCommand registers a cli command
+// Collection of minio flags currently supported.
+var globalFlags = []cli.Flag{
+	cli.StringFlag{
+		Name:  "config-dir, C",
+		Value: mustGetConfigPath(),
+		Usage: "Path to configuration folder.",
+	},
+	cli.BoolFlag{
+		Name:  "quiet",
+		Usage: "Suppress chatty output.",
+	},
+}
+
+// registerCommand registers a cli command.
 func registerCommand(command cli.Command) {
 	commands = append(commands, command)
 	commandsTree.Insert(command.Name)

@@ -19,36 +19,46 @@ package main
 import (
 	"net/url"
 	"strconv"
-
-	"github.com/minio/minio/pkg/fs"
 )
 
-// parse bucket url queries
+// Parse bucket url queries
 func getBucketResources(values url.Values) (prefix, marker, delimiter string, maxkeys int, encodingType string) {
 	prefix = values.Get("prefix")
 	marker = values.Get("marker")
 	delimiter = values.Get("delimiter")
-	maxkeys, _ = strconv.Atoi(values.Get("max-keys"))
+	if values.Get("max-keys") != "" {
+		maxkeys, _ = strconv.Atoi(values.Get("max-keys"))
+	} else {
+		maxkeys = maxObjectList
+	}
 	encodingType = values.Get("encoding-type")
 	return
 }
 
-// part bucket url queries for ?uploads
-func getBucketMultipartResources(values url.Values) (v fs.BucketMultipartResourcesMetadata) {
-	v.Prefix = values.Get("prefix")
-	v.KeyMarker = values.Get("key-marker")
-	v.MaxUploads, _ = strconv.Atoi(values.Get("max-uploads"))
-	v.Delimiter = values.Get("delimiter")
-	v.EncodingType = values.Get("encoding-type")
-	v.UploadIDMarker = values.Get("upload-id-marker")
+// Parse bucket url queries for ?uploads
+func getBucketMultipartResources(values url.Values) (prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int, encodingType string) {
+	prefix = values.Get("prefix")
+	keyMarker = values.Get("key-marker")
+	uploadIDMarker = values.Get("upload-id-marker")
+	delimiter = values.Get("delimiter")
+	if values.Get("max-uploads") != "" {
+		maxUploads, _ = strconv.Atoi(values.Get("max-uploads"))
+	} else {
+		maxUploads = maxUploadsList
+	}
+	encodingType = values.Get("encoding-type")
 	return
 }
 
-// parse object url queries
-func getObjectResources(values url.Values) (v fs.ObjectResourcesMetadata) {
-	v.UploadID = values.Get("uploadId")
-	v.PartNumberMarker, _ = strconv.Atoi(values.Get("part-number-marker"))
-	v.MaxParts, _ = strconv.Atoi(values.Get("max-parts"))
-	v.EncodingType = values.Get("encoding-type")
+// Parse object url queries
+func getObjectResources(values url.Values) (uploadID string, partNumberMarker, maxParts int, encodingType string) {
+	uploadID = values.Get("uploadId")
+	partNumberMarker, _ = strconv.Atoi(values.Get("part-number-marker"))
+	if values.Get("max-parts") != "" {
+		maxParts, _ = strconv.Atoi(values.Get("max-parts"))
+	} else {
+		maxParts = maxPartsList
+	}
+	encodingType = values.Get("encoding-type")
 	return
 }

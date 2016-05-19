@@ -17,18 +17,14 @@
 package main
 
 import (
-	"errors"
 	"net/http"
+	"path"
+	"regexp"
 	"strings"
 	"time"
 
 	router "github.com/gorilla/mux"
 	"github.com/rs/cors"
-)
-
-const (
-	iso8601Format = "20060102T150405Z"
-	privateBucket = "/minio"
 )
 
 // HandlerFunc - useful to chain different middleware http.Handler
@@ -43,74 +39,29 @@ func registerHandlers(mux *router.Router, handlerFns ...HandlerFunc) http.Handle
 	return f
 }
 
-// Attempts to parse date string into known date layouts. Date layouts
-// currently supported are ``time.RFC1123``, ``time.RFC1123Z`` and
-// special ``iso8601Format``.
-func parseKnownLayouts(date string) (time.Time, error) {
-	parsedTime, e := time.Parse(time.RFC1123, date)
-	if e == nil {
-		return parsedTime, nil
-	}
-	parsedTime, e = time.Parse(time.RFC1123Z, date)
-	if e == nil {
-		return parsedTime, nil
-	}
-	parsedTime, e = time.Parse(iso8601Format, date)
-	if e == nil {
-		return parsedTime, nil
-	}
-	return time.Time{}, e
-}
-
-// Parse date string from incoming header, current supports and verifies
-// follow HTTP headers.
-//
-//  - X-Amz-Date
-//  - X-Minio-Date
-//  - Date
-//
-// In following time layouts ``time.RFC1123``, ``time.RFC1123Z`` and ``iso8601Format``.
-func parseDateHeader(req *http.Request) (time.Time, error) {
-	amzDate := req.Header.Get(http.CanonicalHeaderKey("x-amz-date"))
-	if amzDate != "" {
-		return parseKnownLayouts(amzDate)
-	}
-	minioDate := req.Header.Get(http.CanonicalHeaderKey("x-minio-date"))
-	if minioDate != "" {
-		return parseKnownLayouts(minioDate)
-	}
-	genericDate := req.Header.Get("Date")
-	if genericDate != "" {
-		return parseKnownLayouts(genericDate)
-	}
-	return time.Time{}, errors.New("Date header missing, invalid request.")
-}
-
 // Adds redirect rules for incoming requests.
 type redirectHandler struct {
 	handler        http.Handler
 	locationPrefix string
 }
 
+// Reserved bucket.
+const (
+	reservedBucket = "/minio"
+)
+
 func setBrowserRedirectHandler(h http.Handler) http.Handler {
-	return redirectHandler{handler: h, locationPrefix: privateBucket}
+	return redirectHandler{handler: h, locationPrefix: reservedBucket}
 }
 
 func (h redirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Re-direction handled specifically for browsers.
 	if strings.Contains(r.Header.Get("User-Agent"), "Mozilla") {
+		// '/' is redirected to 'locationPrefix/'
+		// '/webrpc' is redirected to 'locationPrefix/webrpc'
+		// '/login' is redirected to 'locationPrefix/login'
 		switch r.URL.Path {
-		case "/":
-			// This could be the default route for browser, redirect
-			// to 'locationPrefix/'.
-			fallthrough
-		case "/rpc":
-			// This is '/rpc' API route for browser, redirect to
-			// 'locationPrefix/rpc'.
-			fallthrough
-		case "/login":
-			// This is '/login' route for browser, redirect to
-			// 'locationPrefix/login'.
+		case "/", "/webrpc", "/login", "/favicon.ico":
 			location := h.locationPrefix + r.URL.Path
 			// Redirect to new location.
 			http.Redirect(w, r, location, http.StatusTemporaryRedirect)
@@ -131,29 +82,80 @@ func setBrowserCacheControlHandler(h http.Handler) http.Handler {
 
 func (h cacheControlHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" && strings.Contains(r.Header.Get("User-Agent"), "Mozilla") {
-		// Expire cache in one hour for all browser requests.
-		w.Header().Set("Cache-Control", "public, max-age=3600")
+		// For all browser requests set appropriate Cache-Control policies
+		match, e := regexp.MatchString(reservedBucket+`/([^/]+\.js|favicon.ico)`, r.URL.Path)
+		if e != nil {
+			writeErrorResponse(w, r, ErrInternalError, r.URL.Path)
+			return
+		}
+		if match {
+			// For assets set cache expiry of one year. For each release, the name
+			// of the asset name will change and hence it can not be served from cache.
+			w.Header().Set("Cache-Control", "max-age=31536000")
+		} else if strings.HasPrefix(r.URL.Path, reservedBucket+"/") {
+			// For non asset requests we serve index.html which will never be cached.
+			w.Header().Set("Cache-Control", "no-store")
+		}
 	}
 	h.handler.ServeHTTP(w, r)
 }
 
 // Adds verification for incoming paths.
 type minioPrivateBucketHandler struct {
-	handler       http.Handler
-	privateBucket string
+	handler        http.Handler
+	reservedBucket string
 }
 
 func setPrivateBucketHandler(h http.Handler) http.Handler {
-	return minioPrivateBucketHandler{handler: h, privateBucket: privateBucket}
+	return minioPrivateBucketHandler{handler: h, reservedBucket: reservedBucket}
 }
 
 func (h minioPrivateBucketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// For all non browser requests, reject access to 'privateBucket'.
-	if !strings.Contains(r.Header.Get("User-Agent"), "Mozilla") && strings.HasPrefix(r.URL.Path, privateBucket) {
-		writeErrorResponse(w, r, AllAccessDisabled, r.URL.Path)
+	// For all non browser requests, reject access to 'reservedBucket'.
+	if !strings.Contains(r.Header.Get("User-Agent"), "Mozilla") && path.Clean(r.URL.Path) == reservedBucket {
+		writeErrorResponse(w, r, ErrAllAccessDisabled, r.URL.Path)
 		return
 	}
 	h.handler.ServeHTTP(w, r)
+}
+
+// Supported Amz date formats.
+var amzDateFormats = []string{
+	time.RFC1123,
+	time.RFC1123Z,
+	iso8601Format,
+	// Add new AMZ date formats here.
+}
+
+// parseAmzDate - parses date string into supported amz date formats.
+func parseAmzDate(amzDateStr string) (amzDate time.Time, apiErr APIErrorCode) {
+	for _, dateFormat := range amzDateFormats {
+		amzDate, e := time.Parse(dateFormat, amzDateStr)
+		if e == nil {
+			return amzDate, ErrNone
+		}
+	}
+	return time.Time{}, ErrMalformedDate
+}
+
+// Supported Amz date headers.
+var amzDateHeaders = []string{
+	"x-amz-date",
+	"x-minio-date",
+	"date",
+}
+
+// parseAmzDateHeader - parses supported amz date headers, in
+// supported amz date formats.
+func parseAmzDateHeader(req *http.Request) (time.Time, APIErrorCode) {
+	for _, amzDateHeader := range amzDateHeaders {
+		amzDateStr := req.Header.Get(http.CanonicalHeaderKey(amzDateHeader))
+		if amzDateStr != "" {
+			return parseAmzDate(amzDateStr)
+		}
+	}
+	// Date header missing.
+	return time.Time{}, ErrMissingDateHeader
 }
 
 type timeHandler struct {
@@ -167,21 +169,19 @@ func setTimeValidityHandler(h http.Handler) http.Handler {
 
 func (h timeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Verify if date headers are set, if not reject the request
-	if r.Header.Get("Authorization") != "" {
-		date, e := parseDateHeader(r)
-		if e != nil {
+	if _, ok := r.Header["Authorization"]; ok {
+		amzDate, apiErr := parseAmzDateHeader(r)
+		if apiErr != ErrNone {
 			// All our internal APIs are sensitive towards Date
 			// header, for all requests where Date header is not
 			// present we will reject such clients.
-			writeErrorResponse(w, r, RequestTimeTooSkewed, r.URL.Path)
+			writeErrorResponse(w, r, apiErr, r.URL.Path)
 			return
 		}
-		duration := time.Since(date)
-		minutes := time.Duration(5) * time.Minute
 		// Verify if the request date header is more than 5minutes
 		// late, reject such clients.
-		if duration.Minutes() > minutes.Minutes() {
-			writeErrorResponse(w, r, RequestTimeTooSkewed, r.URL.Path)
+		if time.Now().UTC().Sub(amzDate)/time.Minute > time.Duration(5)*time.Minute {
+			writeErrorResponse(w, r, ErrRequestTimeTooSkewed, r.URL.Path)
 			return
 		}
 	}
@@ -198,6 +198,7 @@ func setCorsHandler(h http.Handler) http.Handler {
 		AllowedOrigins: []string{"*"},
 		AllowedMethods: []string{"GET", "HEAD", "POST", "PUT"},
 		AllowedHeaders: []string{"*"},
+		ExposedHeaders: []string{"ETag"},
 	})
 	return c.Handler(h)
 }
@@ -228,20 +229,20 @@ func (h resourceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// level resource queries.
 	if bucketName != "" && objectName == "" {
 		if ignoreNotImplementedBucketResources(r) {
-			writeErrorResponse(w, r, NotImplemented, r.URL.Path)
+			writeErrorResponse(w, r, ErrNotImplemented, r.URL.Path)
 			return
 		}
 	}
 	// If bucketName and objectName are present check for its resource queries.
 	if bucketName != "" && objectName != "" {
 		if ignoreNotImplementedObjectResources(r) {
-			writeErrorResponse(w, r, NotImplemented, r.URL.Path)
+			writeErrorResponse(w, r, ErrNotImplemented, r.URL.Path)
 			return
 		}
 	}
 	// A put method on path "/" doesn't make sense, ignore it.
 	if r.Method == "PUT" && r.URL.Path == "/" {
-		writeErrorResponse(w, r, NotImplemented, r.URL.Path)
+		writeErrorResponse(w, r, ErrNotImplemented, r.URL.Path)
 		return
 	}
 	h.handler.ServeHTTP(w, r)
@@ -251,8 +252,7 @@ func (h resourceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Checks requests for not implemented Bucket resources
 func ignoreNotImplementedBucketResources(req *http.Request) bool {
-	q := req.URL.Query()
-	for name := range q {
+	for name := range req.URL.Query() {
 		if notimplementedBucketResourceNames[name] {
 			return true
 		}
@@ -262,11 +262,32 @@ func ignoreNotImplementedBucketResources(req *http.Request) bool {
 
 // Checks requests for not implemented Object resources
 func ignoreNotImplementedObjectResources(req *http.Request) bool {
-	q := req.URL.Query()
-	for name := range q {
+	for name := range req.URL.Query() {
 		if notimplementedObjectResourceNames[name] {
 			return true
 		}
 	}
 	return false
+}
+
+// List of not implemented bucket queries
+var notimplementedBucketResourceNames = map[string]bool{
+	"acl":            true,
+	"cors":           true,
+	"lifecycle":      true,
+	"logging":        true,
+	"notification":   true,
+	"replication":    true,
+	"tagging":        true,
+	"versions":       true,
+	"requestPayment": true,
+	"versioning":     true,
+	"website":        true,
+}
+
+// List of not implemented object queries
+var notimplementedObjectResourceNames = map[string]bool{
+	"torrent": true,
+	"acl":     true,
+	"policy":  true,
 }

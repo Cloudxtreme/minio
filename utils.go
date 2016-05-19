@@ -18,33 +18,38 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/xml"
+	"io"
 	"strings"
 )
 
-// isValidMD5 - verify if valid md5
-func isValidMD5(md5 string) bool {
-	if md5 == "" {
-		return true
-	}
-	_, err := base64.StdEncoding.DecodeString(strings.TrimSpace(md5))
-	if err != nil {
-		return false
-	}
-	return true
+// xmlDecoder provide decoded value in xml.
+func xmlDecoder(body io.Reader, v interface{}) error {
+	d := xml.NewDecoder(body)
+	return d.Decode(v)
+}
+
+// checkValidMD5 - verify if valid md5, returns md5 in bytes.
+func checkValidMD5(md5 string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(strings.TrimSpace(md5))
 }
 
 /// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
 const (
 	// maximum object size per PUT request is 5GiB
 	maxObjectSize = 1024 * 1024 * 1024 * 5
+	// minimum Part size for multipart upload is 5MB
+	minPartSize = 1024 * 1024 * 5
 )
 
 // isMaxObjectSize - verify if max object size
 func isMaxObjectSize(size int64) bool {
-	if size > maxObjectSize {
-		return true
-	}
-	return false
+	return size > maxObjectSize
+}
+
+// Check if part size is more than or equal to minimum allowed size.
+func isMinAllowedPartSize(size int64) bool {
+	return size >= minPartSize
 }
 
 func contains(stringList []string, element string) bool {
@@ -53,6 +58,5 @@ func contains(stringList []string, element string) bool {
 			return true
 		}
 	}
-
 	return false
 }

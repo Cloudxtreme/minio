@@ -16,7 +16,34 @@
 
 package main
 
+import "github.com/fatih/color"
+
 // Global constants for Minio.
 const (
-	minGoVersion = ">= 1.5.1" // Minio requires at least Go v1.5.1
+	minGoVersion = ">= 1.6" // Minio requires at least Go v1.6
+)
+
+// minio configuration related constants.
+const (
+	globalMinioConfigVersion = "4"
+	globalMinioConfigDir     = ".minio"
+	globalMinioCertsDir      = ".minio/certs"
+	globalMinioCertFile      = "public.crt"
+	globalMinioKeyFile       = "private.key"
+	globalMinioConfigFile    = "config.json"
+	globalMinioProfilePath   = "profile"
+	// Add new global values here.
+)
+
+var (
+	globalQuiet = false // Quiet flag set via command line
+	globalTrace = false // Trace flag set via environment setting.
+	// Add new global flags here.
+)
+
+// global colors.
+var (
+	colorMagenta = color.New(color.FgMagenta, color.Bold).SprintfFunc()
+	colorWhite   = color.New(color.FgWhite, color.Bold).SprintfFunc()
+	colorGreen   = color.New(color.FgGreen, color.Bold).SprintfFunc()
 )

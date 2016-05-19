@@ -1,6 +1,6 @@
 {
 	"comment": "",
-	"ignore": "",
+	"ignore": "appengine test",
 	"package": [
 		{
 			"path": "github.com/Sirupsen/logrus",
@@ -24,13 +24,18 @@
 		},
 		{
 			"path": "github.com/fatih/color",
-			"revision": "76d423163af754ff6423d2d9be0057fbf03c57c2",
-			"revisionTime": "2015-08-24T00:44:34+03:00"
+			"revision": "7a5857db0b2752a436d8461d88c42dea0ee191c0",
+			"revisionTime": "2016-02-12T11:24:09+02:00"
 		},
 		{
 			"path": "github.com/gorilla/context",
 			"revision": "1c83b3eabd45b6d76072b66b746c20815fb2872d",
 			"revisionTime": "2015-08-19T22:12:45-07:00"
+		},
+		{
+			"path": "github.com/gorilla/handlers",
+			"revision": "ee54c7b44cab12289237fb8631314790076e728b",
+			"revisionTime": "2016-02-28T09:16:04-08:00"
 		},
 		{
 			"path": "github.com/gorilla/mux",
@@ -58,6 +63,16 @@
 			"revisionTime": "2016-01-06T11:44:51+01:00"
 		},
 		{
+			"path": "github.com/klauspost/reedsolomon",
+			"revision": "4fadad856421f3f13883bd681de8a9283809076e",
+			"revisionTime": "2016-05-01T12:00:51+02:00"
+		},
+		{
+			"path": "github.com/mattn/go-colorable",
+			"revision": "9cbef7c35391cca05f15f8181dc0b18bc9736dbb",
+			"revisionTime": "2016-02-20T16:59:35+09:00"
+		},
+		{
 			"path": "github.com/mattn/go-isatty",
 			"revision": "7fcbc72f853b92b5720db4a6b8482be612daef24",
 			"revisionTime": "2015-08-14T09:26:29+09:00"
@@ -73,9 +88,14 @@
 			"revisionTime": "2016-02-15T17:25:11+05:30"
 		},
 		{
-			"path": "github.com/minio/minio-go",
-			"revision": "280f16a52008d3ebba1bd64398b9b082e6738386",
-			"revisionTime": "2016-02-07T03:45:25-08:00"
+			"path": "github.com/minio/mc/pkg/console",
+			"revision": "db6b4f13442b26995f04b3b2b31b006cae7786e6",
+			"revisionTime": "2016-02-29T08:42:30-08:00"
+		},
+		{
+			"path": "github.com/minio/miniobrowser",
+			"revision": "16a35547d5b0aea8de96b74416929ab2e2d248cd",
+			"revisionTime": "2016-04-21T19:57:24-07:00"
 		},
 		{
 			"path": "github.com/mitchellh/go-homedir",
@@ -83,14 +103,25 @@
 			"revisionTime": "2015-10-24T22:24:27-07:00"
 		},
 		{
+			"path": "github.com/olekukonko/ts",
+			"revision": "ecf753e7c962639ab5a1fb46f7da627d4c0a04b8",
+			"revisionTime": "2014-04-12T15:01:45-07:00"
+		},
+		{
+			"path": "github.com/pkg/profile",
+			"revision": "c78aac22bd43883fd2817833b982153dcac17b3b",
+			"revisionTime": "2016-05-18T16:56:57+10:00"
+		},
+		{
 			"path": "github.com/rs/cors",
 			"revision": "eb527c8097e0f19a3ff7b253a3fe70545070f420",
 			"revisionTime": "2015-08-29T22:34:20-07:00"
 		},
 		{
-			"path": "github.com/shiena/ansicolor",
-			"revision": "a5e2b567a4dd6cc74545b8a4f27c9d63b9e7735b",
-			"revisionTime": "2015-07-19T16:15:31+09:00"
+			"checksumSHA1": "u0hXGADM3JDza8YjgiyNJpAJk8g=",
+			"path": "github.com/skyrings/skyring-common/tools/uuid",
+			"revision": "762fd2bfc12e766d90478d638255981ab1966a3d",
+			"revisionTime": "2016-03-24T19:44:43+05:30"
 		},
 		{
 			"path": "golang.org/x/crypto/bcrypt",
@@ -106,26 +137,7 @@
 			"path": "gopkg.in/check.v1",
 			"revision": "11d3bc7aa68e238947792f30573146a3231fc0f1",
 			"revisionTime": "2015-07-29T10:04:31+02:00"
-		},
-		{
-			"path": "gopkg.in/mgo.v2",
-			"revision": "f402e3a216db333ae6b3ba68b9152a34a0bc6984",
-			"revisionTime": "2015-10-05T19:07:38-07:00"
-		},
-		{
-			"path": "gopkg.in/mgo.v2/bson",
-			"revision": "f402e3a216db333ae6b3ba68b9152a34a0bc6984",
-			"revisionTime": "2015-10-05T19:07:38-07:00"
-		},
-		{
-			"path": "gopkg.in/mgo.v2/internal/sasl",
-			"revision": "f402e3a216db333ae6b3ba68b9152a34a0bc6984",
-			"revisionTime": "2015-10-05T19:07:38-07:00"
-		},
-		{
-			"path": "gopkg.in/mgo.v2/internal/scram",
-			"revision": "f402e3a216db333ae6b3ba68b9152a34a0bc6984",
-			"revisionTime": "2015-10-05T19:07:38-07:00"
 		}
-	]
+	],
+	"rootPath": "github.com/minio/minio"
 }

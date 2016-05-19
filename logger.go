@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 package main
 
 import (
-	"encoding/json"
 	"reflect"
+	"runtime/debug"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/minio/minio/pkg/probe"
@@ -28,38 +28,52 @@ type fields map[string]interface{}
 
 var log = logrus.New() // Default console logger.
 
-func errorIf(err *probe.Error, msg string, fields map[string]interface{}) {
-	if err == nil {
-		return
-	}
-	if fields == nil {
-		fields = make(map[string]interface{})
-	}
-	fields["Error"] = struct {
-		Cause     string             `json:"cause,omitempty"`
-		Type      string             `json:"type,omitempty"`
-		CallTrace []probe.TracePoint `json:"trace,omitempty"`
-		SysInfo   map[string]string  `json:"sysinfo,omitempty"`
-	}{
-		err.Cause.Error(),
-		reflect.TypeOf(err.Cause).String(),
-		err.CallTrace,
-		err.SysInfo,
-	}
-	log.WithFields(fields).Error(msg)
+// logger carries logging configuration for various supported loggers.
+// Currently supported loggers are
+//
+//   - console [default]
+//   - file
+//   - syslog
+//
+type logger struct {
+	Console consoleLogger `json:"console"`
+	File    fileLogger    `json:"file"`
+	Syslog  syslogLogger  `json:"syslog"`
+	// Add new loggers here.
 }
 
-func fatalIf(err *probe.Error, msg string, fields map[string]interface{}) {
+// errorIf synonymous with fatalIf but doesn't exit on error != nil
+func errorIf(err error, msg string, data ...interface{}) {
 	if err == nil {
 		return
 	}
-	if fields == nil {
-		fields = make(map[string]interface{})
+	sysInfo := probe.GetSysInfo()
+	fields := logrus.Fields{
+		"cause":   err.Error(),
+		"type":    reflect.TypeOf(err),
+		"sysInfo": sysInfo,
 	}
+	if globalTrace {
+		stack := debug.Stack()
+		fields["stack"] = string(stack)
+	}
+	log.WithFields(fields).Errorf(msg, data...)
+}
 
-	fields["error"] = err.ToGoError()
-	if jsonErr, e := json.Marshal(err); e == nil {
-		fields["probe"] = string(jsonErr)
+// fatalIf wrapper function which takes error and prints jsonic error messages.
+func fatalIf(err error, msg string, data ...interface{}) {
+	if err == nil {
+		return
 	}
-	log.WithFields(fields).Fatal(msg)
+	sysInfo := probe.GetSysInfo()
+	fields := logrus.Fields{
+		"cause":   err.Error(),
+		"type":    reflect.TypeOf(err),
+		"sysInfo": sysInfo,
+	}
+	if globalTrace {
+		stack := debug.Stack()
+		fields["stack"] = string(stack)
+	}
+	log.WithFields(fields).Fatalf(msg, data...)
 }

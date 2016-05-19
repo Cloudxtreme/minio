@@ -1,7 +1,15 @@
-# use "make dockerimage" to build
-FROM scratch
-ADD minio.dockerimage /minio
-ADD export /export
+FROM golang:1.6
+
+RUN mkdir -p /go/src/app
+WORKDIR /go/src/app
+
+COPY . /go/src/app
+RUN go-wrapper download
+RUN go-wrapper install
+
+ENV ALLOW_CONTAINER_ROOT=1
+RUN mkdir -p /export/docker && cp /go/src/app/Docker.md /export/docker/
+
 EXPOSE 9000
-ENTRYPOINT ["/minio"]
-CMD ["server", "/export"]
+ENTRYPOINT ["go-wrapper", "run", "server"]
+CMD ["/export"]

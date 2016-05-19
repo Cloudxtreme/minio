@@ -1,7 +1,7 @@
 // +build !windows
 
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,8 +23,13 @@ import (
 	"log/syslog"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/minio/minio/pkg/probe"
 )
+
+type syslogLogger struct {
+	Enable bool   `json:"enable"`
+	Addr   string `json:"address"`
+	Level  string `json:"level"`
+}
 
 // syslogHook to send logs via syslog.
 type syslogHook struct {
@@ -33,15 +38,14 @@ type syslogHook struct {
 	syslogRaddr   string
 }
 
-func log2Syslog(network, raddr string) *probe.Error {
-	syslogHook, e := newSyslog(network, raddr, syslog.LOG_ERR, "MINIO")
-	if e != nil {
-		return probe.NewError(e)
-	}
+// enableSyslogLogger - enable logger at raddr.
+func enableSyslogLogger(raddr string) {
+	syslogHook, err := newSyslog("udp", raddr, syslog.LOG_ERR, "MINIO")
+	fatalIf(err, "Unable to initialize syslog logger.")
+
 	log.Hooks.Add(syslogHook)               // Add syslog hook.
 	log.Formatter = &logrus.JSONFormatter{} // JSON formatted log.
-	log.Level = logrus.InfoLevel            // Minimum log level.
-	return nil
+	log.Level = logrus.ErrorLevel           // Minimum log level.
 }
 
 // newSyslog - Creates a hook to be added to an instance of logger.
@@ -63,12 +67,6 @@ func (hook *syslogHook) Fire(entry *logrus.Entry) error {
 		return hook.writer.Crit(line)
 	case logrus.ErrorLevel:
 		return hook.writer.Err(line)
-	case logrus.WarnLevel:
-		return hook.writer.Warning(line)
-	case logrus.InfoLevel:
-		return hook.writer.Info(line)
-	case logrus.DebugLevel:
-		return hook.writer.Debug(line)
 	default:
 		return nil
 	}
@@ -80,8 +78,5 @@ func (hook *syslogHook) Levels() []logrus.Level {
 		logrus.PanicLevel,
 		logrus.FatalLevel,
 		logrus.ErrorLevel,
-		logrus.WarnLevel,
-		logrus.InfoLevel,
-		logrus.DebugLevel,
 	}
 }

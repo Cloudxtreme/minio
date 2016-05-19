@@ -24,12 +24,13 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-version"
+	"github.com/minio/mc/pkg/console"
 )
 
 // isContainerized returns true if we are inside a containerized environment.
 func isContainerized() bool {
-	// Docker containers contain ".dockerinit" at its root path.
-	if _, e := os.Stat("/.dockerinit"); e == nil {
+	// Docker containers contain ".dockerenv" at their root path.
+	if _, e := os.Stat("/.dockerenv"); e == nil {
 		return true
 	}
 
@@ -38,6 +39,11 @@ func isContainerized() bool {
 		if strings.Contains(string(cgroupData), "/docker-") {
 			return true
 		}
+	}
+
+	// Check if env var explicitly set
+	if allow := os.Getenv("ALLOW_CONTAINER_ROOT"); allow == "1" || strings.ToLower(allow) == "true" {
+		return true
 	}
 
 	/* Add checks for non-docker containers here. */
@@ -49,17 +55,17 @@ func checkGoVersion() {
 	// Current version.
 	curVersion, e := version.NewVersion(runtime.Version()[2:])
 	if e != nil {
-		Fatalln("Unable to determine current go version.", e)
+		console.Fatalln("Unable to determine current go version.", e)
 	}
 
 	// Prepare version constraint.
 	constraints, e := version.NewConstraint(minGoVersion)
 	if e != nil {
-		Fatalln("Unable to check go version.")
+		console.Fatalln("Unable to check go version.")
 	}
 
 	// Check for minimum version.
 	if !constraints.Check(curVersion) {
-		Fatalln(fmt.Sprintf("Please recompile Minio with Golang version %s.", minGoVersion))
+		console.Fatalln(fmt.Sprintf("Please recompile Minio with Golang version %s.", minGoVersion))
 	}
 }

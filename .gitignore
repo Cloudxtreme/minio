@@ -9,7 +9,9 @@ site/
 /.idea/
 /Minio.iml
 **/access.log
-ui-assets.go
-ui-assets.asc
 build
-isa-l
+vendor/**/*.js
+vendor/**/*.json
+release
+.DS_Store
+*.syso

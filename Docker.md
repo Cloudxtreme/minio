@@ -1,53 +1,28 @@
-## Running Minio in Docker.
+### Run Minio docker image
 
-### Installing Docker.
-
+## Test Minio Docker Container
+Minio generates new access and secret keys each time you run this command. Container state is lost after you end this session. This mode is only intended for testing purpose.
 ```bash
-sudo apt-get install Docker.io
+docker run -p 9000:9000 minio/minio /export
 ```
 
-### Generating `minio configs` for the first time.
+## Run Minio Docker Container
+Minio container requires a persistent volume to store configuration and application data. Following command maps local persistent directories from the host OS to virtual config `~/.minio` and export `/export` directories. 
 
 ```bash
-docker run -p 9000 minio/minio:latest
+docker run -p 9000:9000 --name minio1 \
+  -v /mnt/export/minio1:/export \
+  -v /mnt/config/minio1:/root/.minio \
+  minio/minio /export
 ```
 
-### Persist `minio configs`.
-
+## Custom Access and Secret Keys
+To override Minio's auto-generated keys, you may pass secret and access keys explicitly as environment variables. Minio server also allows regular strings as access and secret keys.
 ```bash
-docker commit <running_minio_container_id> minio/my-minio
-docker stop <running_minio_container_id>
-```
-
-### Create a data volume container.
-
-```bash
-docker create -v /export --name minio-export minio/my-minio /bin/true
-```
-
-You can then use the `--volumes-from` flag to mount the `/export` volume in another container.
-
-```bash
-docker run -p 9000 --volumes-from minio-export --name minio1 minio/my-minio
-```
-
-### Setup a sample proxy in front using Caddy.
-
-Please download [Caddy Server](https://caddyserver.com/download)
-
-Create a caddy configuration file as below, change the ip addresses for your environment.
-```bash
-cat Caddyfile
-10.0.0.3:2015 {
-    proxy / localhost:9000 {
-        proxy_header Host {host}
-    }
-    tls off
-}
-```
-
-```bash
-$ ./caddy
-Activating privacy features... done.
-10.0.0.3:2015
+docker run -p 9000:9000 --name minio1 \
+  -e "MINIO_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE" \
+  -e "MINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
+  -v /mnt/export/minio1:/export \
+  -v /mnt/config/minio1:/root/.minio \
+  minio/minio /export
 ```
