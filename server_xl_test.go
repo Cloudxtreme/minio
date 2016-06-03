@@ -624,6 +624,7 @@ func (s *MyAPIXLSuite) TestPutBucket(c *C) {
 
 }
 
+// Tests copy object.
 func (s *MyAPIXLSuite) TestCopyObject(c *C) {
 	request, err := s.newRequest("PUT", testAPIXLServer.URL+"/put-object-copy", 0, nil)
 	c.Assert(err, IsNil)
@@ -635,6 +636,7 @@ func (s *MyAPIXLSuite) TestCopyObject(c *C) {
 
 	buffer1 := bytes.NewReader([]byte("hello world"))
 	request, err = s.newRequest("PUT", testAPIXLServer.URL+"/put-object-copy/object", int64(buffer1.Len()), buffer1)
+	request.Header.Set("Content-Type", "application/json")
 	c.Assert(err, IsNil)
 
 	response, err = client.Do(request)
@@ -657,10 +659,11 @@ func (s *MyAPIXLSuite) TestCopyObject(c *C) {
 	c.Assert(response.StatusCode, Equals, http.StatusOK)
 	object, err := ioutil.ReadAll(response.Body)
 	c.Assert(err, IsNil)
-
 	c.Assert(string(object), Equals, "hello world")
+	c.Assert(response.Header.Get("Content-Type"), Equals, "application/json")
 }
 
+// Tests successful put object request.
 func (s *MyAPIXLSuite) TestPutObject(c *C) {
 	request, err := s.newRequest("PUT", testAPIXLServer.URL+"/put-object", 0, nil)
 	c.Assert(err, IsNil)
@@ -677,8 +680,22 @@ func (s *MyAPIXLSuite) TestPutObject(c *C) {
 	response, err = client.Do(request)
 	c.Assert(err, IsNil)
 	c.Assert(response.StatusCode, Equals, http.StatusOK)
+
+	request, err = s.newRequest("GET", testAPIXLServer.URL+"/put-object/object", 0, nil)
+	c.Assert(err, IsNil)
+
+	response, err = client.Do(request)
+	c.Assert(err, IsNil)
+	c.Assert(response.StatusCode, Equals, http.StatusOK)
+	c.Assert(response.ContentLength, Equals, int64(len([]byte("hello world"))))
+	var buffer2 bytes.Buffer
+	n, err := io.Copy(&buffer2, response.Body)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, int64(len([]byte("hello world"))))
+	c.Assert(true, Equals, bytes.Equal(buffer2.Bytes(), []byte("hello world")))
 }
 
+// Tests put object with long names.
 func (s *MyAPIXLSuite) TestPutObjectLongName(c *C) {
 	request, err := s.newRequest("PUT", testAPIXLServer.URL+"/put-object-long-name", 0, nil)
 	c.Assert(err, IsNil)
@@ -903,18 +920,27 @@ func (s *MyAPIXLSuite) TestPartialContent(c *C) {
 	c.Assert(response.StatusCode, Equals, http.StatusOK)
 
 	// Prepare request
-	request, err = s.newRequest("GET", testAPIXLServer.URL+"/partial-content/bar", 0, nil)
-	c.Assert(err, IsNil)
-	request.Header.Add("Range", "bytes=6-7")
+	var table = []struct {
+		byteRange      string
+		expectedString string
+	}{
+		{"6-7", "Wo"},
+		{"6-", "World"},
+		{"-7", "o World"},
+	}
+	for _, t := range table {
+		request, err = s.newRequest("GET", testAPIXLServer.URL+"/partial-content/bar", 0, nil)
+		c.Assert(err, IsNil)
+		request.Header.Add("Range", "bytes="+t.byteRange)
 
-	client = http.Client{}
-	response, err = client.Do(request)
-	c.Assert(err, IsNil)
-	c.Assert(response.StatusCode, Equals, http.StatusPartialContent)
-	partialObject, err := ioutil.ReadAll(response.Body)
-	c.Assert(err, IsNil)
-
-	c.Assert(string(partialObject), Equals, "Wo")
+		client = http.Client{}
+		response, err = client.Do(request)
+		c.Assert(err, IsNil)
+		c.Assert(response.StatusCode, Equals, http.StatusPartialContent)
+		partialObject, err := ioutil.ReadAll(response.Body)
+		c.Assert(err, IsNil)
+		c.Assert(string(partialObject), Equals, t.expectedString)
+	}
 }
 
 func (s *MyAPIXLSuite) TestListObjectsHandlerErrors(c *C) {
@@ -1258,6 +1284,7 @@ func (s *MyAPIXLSuite) TestObjectMultipartList(c *C) {
 	verifyError(c, response4, "InvalidArgument", "Argument maxParts must be an integer between 1 and 10000.", http.StatusBadRequest)
 }
 
+// Tests object multipart.
 func (s *MyAPIXLSuite) TestObjectMultipart(c *C) {
 	request, err := s.newRequest("PUT", testAPIXLServer.URL+"/objectmultiparts", 0, nil)
 	c.Assert(err, IsNil)
@@ -1340,4 +1367,110 @@ func (s *MyAPIXLSuite) TestObjectMultipart(c *C) {
 	response, err = client.Do(request)
 	c.Assert(err, IsNil)
 	c.Assert(response.StatusCode, Equals, http.StatusOK)
+}
+
+// Tests object multipart overwrite with single put object.
+func (s *MyAPIXLSuite) TestObjectMultipartOverwriteSinglePut(c *C) {
+	request, err := s.newRequest("PUT", testAPIXLServer.URL+"/objectmultiparts-overwrite", 0, nil)
+	c.Assert(err, IsNil)
+
+	client := http.Client{}
+	response, err := client.Do(request)
+	c.Assert(err, IsNil)
+	c.Assert(response.StatusCode, Equals, 200)
+
+	request, err = s.newRequest("POST", testAPIXLServer.URL+"/objectmultiparts-overwrite/object?uploads", 0, nil)
+	c.Assert(err, IsNil)
+
+	client = http.Client{}
+	response, err = client.Do(request)
+	c.Assert(err, IsNil)
+	c.Assert(response.StatusCode, Equals, http.StatusOK)
+
+	decoder := xml.NewDecoder(response.Body)
+	newResponse := &InitiateMultipartUploadResponse{}
+
+	err = decoder.Decode(newResponse)
+	c.Assert(err, IsNil)
+	c.Assert(len(newResponse.UploadID) > 0, Equals, true)
+	uploadID := newResponse.UploadID
+
+	// Create a byte array of 5MB.
+	data := bytes.Repeat([]byte("0123456789abcdef"), 5*1024*1024/16)
+
+	hasher := md5.New()
+	hasher.Write(data)
+	md5Sum := hasher.Sum(nil)
+
+	buffer1 := bytes.NewReader(data)
+	request, err = s.newRequest("PUT", testAPIXLServer.URL+"/objectmultiparts-overwrite/object?uploadId="+uploadID+"&partNumber=1", int64(buffer1.Len()), buffer1)
+	request.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(md5Sum))
+	c.Assert(err, IsNil)
+
+	client = http.Client{}
+	response1, err := client.Do(request)
+	c.Assert(err, IsNil)
+	c.Assert(response1.StatusCode, Equals, http.StatusOK)
+
+	// Create a byte array of 1 byte.
+	data = []byte("0")
+
+	hasher = md5.New()
+	hasher.Write(data)
+	md5Sum = hasher.Sum(nil)
+
+	buffer2 := bytes.NewReader(data)
+	request, err = s.newRequest("PUT", testAPIXLServer.URL+"/objectmultiparts-overwrite/object?uploadId="+uploadID+"&partNumber=2", int64(buffer2.Len()), buffer2)
+	request.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(md5Sum))
+	c.Assert(err, IsNil)
+
+	client = http.Client{}
+	response2, err := client.Do(request)
+	c.Assert(err, IsNil)
+	c.Assert(response2.StatusCode, Equals, http.StatusOK)
+
+	// Complete multipart upload
+	completeUploads := &completeMultipartUpload{
+		Parts: []completePart{
+			{
+				PartNumber: 1,
+				ETag:       response1.Header.Get("ETag"),
+			},
+			{
+				PartNumber: 2,
+				ETag:       response2.Header.Get("ETag"),
+			},
+		},
+	}
+
+	completeBytes, err := xml.Marshal(completeUploads)
+	c.Assert(err, IsNil)
+
+	request, err = s.newRequest("POST", testAPIXLServer.URL+"/objectmultiparts-overwrite/object?uploadId="+uploadID, int64(len(completeBytes)), bytes.NewReader(completeBytes))
+	c.Assert(err, IsNil)
+
+	response, err = client.Do(request)
+	c.Assert(err, IsNil)
+	c.Assert(response.StatusCode, Equals, http.StatusOK)
+
+	buffer1 = bytes.NewReader([]byte("hello world"))
+	request, err = s.newRequest("PUT", testAPIXLServer.URL+"/objectmultiparts-overwrite/object", int64(buffer1.Len()), buffer1)
+	c.Assert(err, IsNil)
+
+	response, err = client.Do(request)
+	c.Assert(err, IsNil)
+	c.Assert(response.StatusCode, Equals, http.StatusOK)
+
+	request, err = s.newRequest("GET", testAPIXLServer.URL+"/objectmultiparts-overwrite/object", 0, nil)
+	c.Assert(err, IsNil)
+
+	response, err = client.Do(request)
+	c.Assert(err, IsNil)
+	c.Assert(response.StatusCode, Equals, http.StatusOK)
+	c.Assert(response.ContentLength, Equals, int64(len([]byte("hello world"))))
+	var buffer3 bytes.Buffer
+	n, err := io.Copy(&buffer3, response.Body)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, int64(len([]byte("hello world"))))
+	c.Assert(true, Equals, bytes.Equal(buffer3.Bytes(), []byte("hello world")))
 }

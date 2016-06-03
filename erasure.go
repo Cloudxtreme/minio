@@ -1,7 +1,5 @@
 /*
- * Quick - Quick key value store for config files and persistent state files
- *
- * Minio Client (C) 2015 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,24 +13,5 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package tasker_test
 
-import (
-	"testing"
-
-	"github.com/minio/minio/pkg/tasker"
-
-	. "gopkg.in/check.v1"
-)
-
-func Test(t *testing.T) { TestingT(t) }
-
-type MySuite struct{}
-
-var _ = Suite(&MySuite{})
-
-func (s *MySuite) TestCheckData(c *C) {
-	testTasks := tasker.New("Test Task")
-	testTasks.Shutdown()
-	// c.Assert(err, Not(IsNil))
-}
+package main

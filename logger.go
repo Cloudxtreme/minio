@@ -17,11 +17,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"os"
 	"reflect"
+	"runtime"
 	"runtime/debug"
+	"strconv"
+	"strings"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/minio/minio/pkg/probe"
+	"github.com/dustin/go-humanize"
 )
 
 type fields map[string]interface{}
@@ -42,20 +48,57 @@ type logger struct {
 	// Add new loggers here.
 }
 
+// sysInfo returns useful system statistics.
+func sysInfo() map[string]string {
+	host, err := os.Hostname()
+	if err != nil {
+		host = ""
+	}
+	memstats := &runtime.MemStats{}
+	runtime.ReadMemStats(memstats)
+	return map[string]string{
+		"host.name":      host,
+		"host.os":        runtime.GOOS,
+		"host.arch":      runtime.GOARCH,
+		"host.lang":      runtime.Version(),
+		"host.cpus":      strconv.Itoa(runtime.NumCPU()),
+		"mem.used":       humanize.Bytes(memstats.Alloc),
+		"mem.total":      humanize.Bytes(memstats.Sys),
+		"mem.heap.used":  humanize.Bytes(memstats.HeapAlloc),
+		"mem.heap.total": humanize.Bytes(memstats.HeapSys),
+	}
+}
+
+// stackInfo returns printable stack trace.
+func stackInfo() string {
+	// Convert stack-trace bytes to io.Reader.
+	rawStack := bufio.NewReader(bytes.NewBuffer(debug.Stack()))
+	// Skip stack trace lines until our real caller.
+	for i := 0; i <= 4; i++ {
+		rawStack.ReadLine()
+	}
+
+	// Read the rest of useful stack trace.
+	stackBuf := new(bytes.Buffer)
+	stackBuf.ReadFrom(rawStack)
+
+	// Strip GOPATH of the build system and return.
+	return strings.Replace(stackBuf.String(), minioGOPATH+"/src/", "", -1)
+}
+
 // errorIf synonymous with fatalIf but doesn't exit on error != nil
 func errorIf(err error, msg string, data ...interface{}) {
 	if err == nil {
 		return
 	}
-	sysInfo := probe.GetSysInfo()
+	sysInfo := sysInfo()
 	fields := logrus.Fields{
 		"cause":   err.Error(),
 		"type":    reflect.TypeOf(err),
 		"sysInfo": sysInfo,
 	}
 	if globalTrace {
-		stack := debug.Stack()
-		fields["stack"] = string(stack)
+		fields["stack"] = "\n" + stackInfo()
 	}
 	log.WithFields(fields).Errorf(msg, data...)
 }
@@ -65,15 +108,14 @@ func fatalIf(err error, msg string, data ...interface{}) {
 	if err == nil {
 		return
 	}
-	sysInfo := probe.GetSysInfo()
+	sysInfo := sysInfo()
 	fields := logrus.Fields{
 		"cause":   err.Error(),
 		"type":    reflect.TypeOf(err),
 		"sysInfo": sysInfo,
 	}
 	if globalTrace {
-		stack := debug.Stack()
-		fields["stack"] = string(stack)
+		fields["stack"] = "\n" + stackInfo()
 	}
 	log.WithFields(fields).Fatalf(msg, data...)
 }
