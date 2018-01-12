@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016,2017 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,194 +14,59 @@
  * limitations under the License.
  */
 
-package main
+/*
+ * Below main package has canonical imports for 'go get' and 'go build'
+ * to work with all other clones of github.com/minio/minio repository. For
+ * more information refer https://golang.org/doc/go1.4#canonicalimports
+ */
+
+package main // import "github.com/minio/minio"
 
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"sort"
+	"runtime"
 
-	"github.com/minio/cli"
+	version "github.com/hashicorp/go-version"
 	"github.com/minio/mc/pkg/console"
-	"github.com/pkg/profile"
+	minio "github.com/minio/minio/cmd"
+
+	// Import gateway
+	_ "github.com/minio/minio/cmd/gateway"
 )
 
-var (
-	// global flags for minio.
-	minioFlags = []cli.Flag{
-		cli.BoolFlag{
-			Name:  "help, h",
-			Usage: "Show help.",
-		},
-	}
+const (
+	// Minio requires at least Go v1.9.1
+	minGoVersion        = "1.9.1"
+	goVersionConstraint = ">= " + minGoVersion
 )
 
-// Help template for minio.
-var minioHelpTemplate = `NAME:
-  {{.Name}} - {{.Usage}}
-
-DESCRIPTION:
-  {{.Description}}
-
-USAGE:
-  minio {{if .Flags}}[flags] {{end}}command{{if .Flags}}{{end}} [arguments...]
-
-COMMANDS:
-  {{range .Commands}}{{join .Names ", "}}{{ "\t" }}{{.Usage}}
-  {{end}}{{if .Flags}}
-FLAGS:
-  {{range .Flags}}{{.}}
-  {{end}}{{end}}
-VERSION:
-  ` + minioVersion +
-	`{{ "\n"}}`
-
-// init - check the environment before main starts
-func init() {
-	// Check if minio was compiled using a supported version of Golang.
-	checkGoVersion()
-
-	// Set global trace flag.
-	globalTrace = os.Getenv("MINIO_TRACE") == "1"
-
-	// It is an unsafe practice to run network services as
-	// root. Containers are an exception.
-	if !isContainerized() && os.Geteuid() == 0 {
-		console.Fatalln("Please run ‘minio’ as a non-root user.")
-	}
-}
-
-func migrate() {
-	// Migrate config file
-	migrateConfig()
-
-	// Migrate other configs here.
-}
-
-func enableLoggers() {
-	// Enable all loggers here.
-	enableConsoleLogger()
-	enableFileLogger()
-
-	// Add your logger here.
-}
-
-func findClosestCommands(command string) []string {
-	var closestCommands []string
-	for _, value := range commandsTree.PrefixMatch(command) {
-		closestCommands = append(closestCommands, value.(string))
-	}
-	sort.Strings(closestCommands)
-	// Suggest other close commands - allow missed, wrongly added and
-	// even transposed characters
-	for _, value := range commandsTree.walk(commandsTree.root) {
-		if sort.SearchStrings(closestCommands, value.(string)) < len(closestCommands) {
-			continue
-		}
-		// 2 is arbitrary and represents the max
-		// allowed number of typed errors
-		if DamerauLevenshteinDistance(command, value.(string)) < 2 {
-			closestCommands = append(closestCommands, value.(string))
-		}
-	}
-	return closestCommands
-}
-
-func registerApp() *cli.App {
-	// Register all commands.
-	registerCommand(serverCmd)
-	registerCommand(versionCmd)
-	registerCommand(updateCmd)
-
-	// Set up app.
-	app := cli.NewApp()
-	app.Name = "Minio"
-	app.Author = "Minio.io"
-	app.Usage = "Cloud Storage Server."
-	app.Description = `Minio is an Amazon S3 compatible object storage server. Use it to store photos, videos, VMs, containers, log files, or any blob of data as objects.`
-	app.Flags = append(minioFlags, globalFlags...)
-	app.Commands = commands
-	app.CustomAppHelpTemplate = minioHelpTemplate
-	app.CommandNotFound = func(ctx *cli.Context, command string) {
-		msg := fmt.Sprintf("‘%s’ is not a minio sub-command. See ‘minio --help’.", command)
-		closestCommands := findClosestCommands(command)
-		if len(closestCommands) > 0 {
-			msg += fmt.Sprintf("\n\nDid you mean one of these?\n")
-			for _, cmd := range closestCommands {
-				msg += fmt.Sprintf("        ‘%s’\n", cmd)
-			}
-		}
-		console.Fatalln(msg)
-	}
-	return app
-}
-
-func checkMainSyntax(c *cli.Context) {
-	configPath, err := getConfigPath()
+// Check if this binary is compiled with at least minimum Go version.
+func checkGoVersion(goVersionStr string) error {
+	constraint, err := version.NewConstraint(goVersionConstraint)
 	if err != nil {
-		console.Fatalf("Unable to obtain user's home directory. \nError: %s\n", err)
+		return fmt.Errorf("'%s': %s", goVersionConstraint, err)
 	}
-	if configPath == "" {
-		console.Fatalln("Config folder cannot be empty, please specify --config-dir <foldername>.")
-	}
-}
 
-// mustGetProfilePath must get location that the profile will be written to.
-func mustGetProfilePath() string {
-	return filepath.Join(mustGetConfigPath(), globalMinioProfilePath)
+	goVersion, err := version.NewVersion(goVersionStr)
+	if err != nil {
+		return err
+	}
+
+	if !constraint.Check(goVersion) {
+		return fmt.Errorf("Minio is not compiled by Go %s.  Please recompile accordingly",
+			goVersionConstraint)
+	}
+
+	return nil
 }
 
 func main() {
-	app := registerApp()
-	app.Before = func(c *cli.Context) error {
-		// Sets new config folder.
-		setGlobalConfigPath(c.GlobalString("config-dir"))
-
-		// Valid input arguments to main.
-		checkMainSyntax(c)
-
-		// Migrate any old version of config / state files to newer format.
-		migrate()
-
-		// Initialize config.
-		err := initConfig()
-		fatalIf(err, "Unable to initialize minio config.")
-
-		// Enable all loggers by now.
-		enableLoggers()
-
-		// Initialize name space lock.
-		initNSLock()
-
-		// Set global quiet flag.
-		globalQuiet = c.Bool("quiet") || c.GlobalBool("quiet")
-
-		// Do not print update messages, if quiet flag is set.
-		if !globalQuiet {
-			// Do not print any errors in release update function.
-			noError := true
-			updateMsg := getReleaseUpdate(minioUpdateStableURL, noError)
-			if updateMsg.Update {
-				console.Println(updateMsg)
-			}
-		}
-
-		return nil
+	// When `go get` is used minimum Go version check is not triggered but it would have compiled it successfully.
+	// However such binary will fail at runtime, hence we also check Go version at runtime.
+	if err := checkGoVersion(runtime.Version()[2:]); err != nil {
+		console.Fatalln("Go runtime version check failed.", err)
 	}
 
-	// Set ``MINIO_PROFILE_DIR`` to the directory where profiling information should be persisted
-	profileDir := os.Getenv("MINIO_PROFILE_DIR")
-	// Enable profiler if ``MINIO_PROFILER`` is set. Supported options are [cpu, mem, block].
-	switch os.Getenv("MINIO_PROFILER") {
-	case "cpu":
-		defer profile.Start(profile.CPUProfile, profile.ProfilePath(profileDir)).Stop()
-	case "mem":
-		defer profile.Start(profile.MemProfile, profile.ProfilePath(profileDir)).Stop()
-	case "block":
-		defer profile.Start(profile.BlockProfile, profile.ProfilePath(profileDir)).Stop()
-	}
-
-	// Run the app - exit on error.
-	app.RunAndExitOnError()
+	minio.Main(os.Args)
 }

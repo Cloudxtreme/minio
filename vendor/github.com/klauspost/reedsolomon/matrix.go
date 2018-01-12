@@ -87,9 +87,9 @@ func (m matrix) Check() error {
 //
 // Example: [[1, 2], [3, 4]]
 func (m matrix) String() string {
-	var rowOut []string
+	rowOut := make([]string, 0, len(m))
 	for _, row := range m {
-		var colOut []string
+		colOut := make([]string, 0, len(row))
 		for _, col := range row {
 			colOut = append(colOut, strconv.Itoa(int(col)))
 		}
@@ -137,7 +137,7 @@ func (m matrix) Augment(right matrix) (matrix, error) {
 }
 
 // errMatrixSize is returned if matrix dimensions are doesn't match.
-var errMatrixSize = errors.New("matrix sizes does not match")
+var errMatrixSize = errors.New("matrix sizes do not match")
 
 func (m matrix) SameSize(n matrix) error {
 	if len(m) != len(n) {
