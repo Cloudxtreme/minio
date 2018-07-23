@@ -17,54 +17,42 @@
 package cmd
 
 import (
-	"crypto"
-	"crypto/sha256"
+	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"path"
-	"runtime"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/minio/minio/pkg/errors"
+	"github.com/minio/highwayhash"
+	"github.com/minio/minio/cmd/logger"
+	sha256 "github.com/minio/sha256-simd"
 	"golang.org/x/crypto/blake2b"
 )
 
 const erasureAlgorithmKlauspost = "klauspost/reedsolomon/vandermonde"
 
-// DefaultBitrotAlgorithm is the default algorithm used for bitrot protection.
-var DefaultBitrotAlgorithm = BLAKE2b512
-
-func init() {
-	newBLAKE2b := func() hash.Hash {
-		b2, _ := blake2b.New512(nil) // New512 never returns an error if the key is nil
-		return b2
-	}
-	crypto.RegisterHash(crypto.Hash(SHA256), sha256.New)
-	crypto.RegisterHash(crypto.Hash(BLAKE2b512), newBLAKE2b)
-	crypto.RegisterHash(crypto.Hash(HighwayHash256), nil) // TODO(aead): currently not supported, waiting for google to finish algorithm spec.
-
-	if runtime.GOARCH == "arm64" { // use SHA256 hardware implementation of arm64
-		DefaultBitrotAlgorithm = SHA256
-	}
-}
+// magic HH-256 key as HH-256 hash of the first 100 decimals of π as utf-8 string with a zero key.
+var magicHighwayHash256Key = []byte("\x4b\xe7\x34\xfa\x8e\x23\x8a\xcd\x26\x3e\x83\xe6\xbb\x96\x85\x52\x04\x0f\x93\x5d\xa3\x9f\x44\x14\x97\xe0\x9d\x13\x22\xde\x36\xa0")
 
 // BitrotAlgorithm specifies a algorithm used for bitrot protection.
-type BitrotAlgorithm crypto.Hash
+type BitrotAlgorithm uint
 
 const (
 	// SHA256 represents the SHA-256 hash function
-	SHA256 = BitrotAlgorithm(crypto.SHA256)
-
+	SHA256 BitrotAlgorithm = 1 + iota
 	// HighwayHash256 represents the HighwayHash-256 hash function
-	HighwayHash256 = BitrotAlgorithm(crypto.SHA3_256) // we must define that HighwayHash-256 is SHA3-256 because there is no HighwayHash constant in golang/crypto yet.
-
+	HighwayHash256
 	// BLAKE2b512 represents the BLAKE2b-256 hash function
-	BLAKE2b512 = BitrotAlgorithm(crypto.SHA3_512) // we must define that BLAKE2b-512 is SHA3-512 because there is no BLAKE2b-512 constant in golang/crypto yet - FIXME: Go1.9 has BLAKE2 constants
+	BLAKE2b512
 )
+
+// DefaultBitrotAlgorithm is the default algorithm used for bitrot protection.
+var DefaultBitrotAlgorithm = HighwayHash256
 
 var bitrotAlgorithms = map[BitrotAlgorithm]string{
 	SHA256:         "sha256",
@@ -72,28 +60,38 @@ var bitrotAlgorithms = map[BitrotAlgorithm]string{
 	HighwayHash256: "highwayhash256",
 }
 
-// New returns a new hash.Hash calculating the given bitrot algorithm. New panics
-// if the algorithm is not supported or not linked into the binary.
+// New returns a new hash.Hash calculating the given bitrot algorithm.
+// New logs error and exits if the algorithm is not supported or not
+// linked into the binary.
 func (a BitrotAlgorithm) New() hash.Hash {
-	if _, ok := bitrotAlgorithms[a]; !ok {
-		panic(fmt.Sprintf("bitrot algorithm #%d is not supported", a))
+	switch a {
+	case SHA256:
+		return sha256.New()
+	case BLAKE2b512:
+		b2, _ := blake2b.New512(nil) // New512 never returns an error if the key is nil
+		return b2
+	case HighwayHash256:
+		hh, _ := highwayhash.New(magicHighwayHash256Key) // New will never return error since key is 256 bit
+		return hh
 	}
-	return crypto.Hash(a).New()
+	logger.CriticalIf(context.Background(), errors.New("Unsupported bitrot algorithm"))
+	return nil
 }
 
 // Available reports whether the given algorihm is a supported and linked into the binary.
 func (a BitrotAlgorithm) Available() bool {
 	_, ok := bitrotAlgorithms[a]
-	return ok && crypto.Hash(a).Available()
+	return ok
 }
 
 // String returns the string identifier for a given bitrot algorithm.
 // If the algorithm is not supported String panics.
 func (a BitrotAlgorithm) String() string {
-	if name, ok := bitrotAlgorithms[a]; ok {
-		return name
+	name, ok := bitrotAlgorithms[a]
+	if !ok {
+		logger.CriticalIf(context.Background(), errors.New("Unsupported bitrot algorithm"))
 	}
-	panic(fmt.Sprintf("bitrot algorithm #%d is not supported", a))
+	return name
 }
 
 // BitrotAlgorithmFromString returns a bitrot algorithm from the given string representation.
@@ -305,6 +303,16 @@ func (m xlMetaV1) ToObjectInfo(bucket, object string) ObjectInfo {
 	// response headers. e.g, X-Minio-* or X-Amz-*.
 	objInfo.UserDefined = cleanMetadata(m.Meta)
 
+	// All the parts per object.
+	objInfo.Parts = m.Parts
+
+	// Update storage class
+	if sc, ok := m.Meta[amzStorageClass]; ok {
+		objInfo.StorageClass = sc
+	} else {
+		objInfo.StorageClass = globalMinioDefaultStorageClass
+	}
+
 	// Success.
 	return objInfo
 }
@@ -344,7 +352,7 @@ func (m *xlMetaV1) AddObjectPart(partNumber int, partName string, partETag strin
 }
 
 // ObjectToPartOffset - translate offset of an object to offset of its individual part.
-func (m xlMetaV1) ObjectToPartOffset(offset int64) (partIndex int, partOffset int64, err error) {
+func (m xlMetaV1) ObjectToPartOffset(ctx context.Context, offset int64) (partIndex int, partOffset int64, err error) {
 	if offset == 0 {
 		// Special case - if offset is 0, then partIndex and partOffset are always 0.
 		return 0, 0, nil
@@ -360,55 +368,57 @@ func (m xlMetaV1) ObjectToPartOffset(offset int64) (partIndex int, partOffset in
 		// Continue to towards the next part.
 		partOffset -= part.Size
 	}
+	logger.LogIf(ctx, InvalidRange{})
 	// Offset beyond the size of the object return InvalidRange.
-	return 0, 0, errors.Trace(InvalidRange{})
+	return 0, 0, InvalidRange{}
 }
 
 // pickValidXLMeta - picks one valid xlMeta content and returns from a
-// slice of xlmeta content. If no value is found this function panics
-// and dies.
-func pickValidXLMeta(metaArr []xlMetaV1, modTime time.Time) (xmv xlMetaV1, e error) {
+// slice of xlmeta content.
+func pickValidXLMeta(ctx context.Context, metaArr []xlMetaV1, modTime time.Time) (xmv xlMetaV1, e error) {
 	// Pick latest valid metadata.
 	for _, meta := range metaArr {
 		if meta.IsValid() && meta.Stat.ModTime.Equal(modTime) {
 			return meta, nil
 		}
 	}
-	return xmv, errors.Trace(fmt.Errorf("No valid xl.json present"))
+	err := fmt.Errorf("No valid xl.json present")
+	logger.LogIf(ctx, err)
+	return xmv, err
 }
 
 // list of all errors that can be ignored in a metadata operation.
 var objMetadataOpIgnoredErrs = append(baseIgnoredErrs, errDiskAccessDenied, errVolumeNotFound, errFileNotFound, errFileAccessDenied, errCorruptedFormat)
 
 // readXLMetaParts - returns the XL Metadata Parts from xl.json of one of the disks picked at random.
-func (xl xlObjects) readXLMetaParts(bucket, object string) (xlMetaParts []objectPartInfo, err error) {
+func (xl xlObjects) readXLMetaParts(ctx context.Context, bucket, object string) (xlMetaParts []objectPartInfo, xlMeta map[string]string, err error) {
 	var ignoredErrs []error
 	for _, disk := range xl.getLoadBalancedDisks() {
 		if disk == nil {
 			ignoredErrs = append(ignoredErrs, errDiskNotFound)
 			continue
 		}
-		xlMetaParts, err = readXLMetaParts(disk, bucket, object)
+		xlMetaParts, xlMeta, err = readXLMetaParts(ctx, disk, bucket, object)
 		if err == nil {
-			return xlMetaParts, nil
+			return xlMetaParts, xlMeta, nil
 		}
 		// For any reason disk or bucket is not available continue
 		// and read from other disks.
-		if errors.IsErrIgnored(err, objMetadataOpIgnoredErrs...) {
+		if IsErrIgnored(err, objMetadataOpIgnoredErrs...) {
 			ignoredErrs = append(ignoredErrs, err)
 			continue
 		}
 		// Error is not ignored, return right here.
-		return nil, err
+		return nil, nil, err
 	}
 	// If all errors were ignored, reduce to maximal occurrence
 	// based on the read quorum.
-	readQuorum := len(xl.storageDisks) / 2
-	return nil, reduceReadQuorumErrs(ignoredErrs, nil, readQuorum)
+	readQuorum := len(xl.getDisks()) / 2
+	return nil, nil, reduceReadQuorumErrs(ctx, ignoredErrs, nil, readQuorum)
 }
 
 // readXLMetaStat - return xlMetaV1.Stat and xlMetaV1.Meta from  one of the disks picked at random.
-func (xl xlObjects) readXLMetaStat(bucket, object string) (xlStat statInfo, xlMeta map[string]string, err error) {
+func (xl xlObjects) readXLMetaStat(ctx context.Context, bucket, object string) (xlStat statInfo, xlMeta map[string]string, err error) {
 	var ignoredErrs []error
 	for _, disk := range xl.getLoadBalancedDisks() {
 		if disk == nil {
@@ -416,13 +426,13 @@ func (xl xlObjects) readXLMetaStat(bucket, object string) (xlStat statInfo, xlMe
 			continue
 		}
 		// parses only xlMetaV1.Meta and xlMeta.Stat
-		xlStat, xlMeta, err = readXLMetaStat(disk, bucket, object)
+		xlStat, xlMeta, err = readXLMetaStat(ctx, disk, bucket, object)
 		if err == nil {
 			return xlStat, xlMeta, nil
 		}
 		// For any reason disk or bucket is not available continue
 		// and read from other disks.
-		if errors.IsErrIgnored(err, objMetadataOpIgnoredErrs...) {
+		if IsErrIgnored(err, objMetadataOpIgnoredErrs...) {
 			ignoredErrs = append(ignoredErrs, err)
 			continue
 		}
@@ -431,31 +441,36 @@ func (xl xlObjects) readXLMetaStat(bucket, object string) (xlStat statInfo, xlMe
 	}
 	// If all errors were ignored, reduce to maximal occurrence
 	// based on the read quorum.
-	readQuorum := len(xl.storageDisks) / 2
-	return statInfo{}, nil, reduceReadQuorumErrs(ignoredErrs, nil, readQuorum)
+	readQuorum := len(xl.getDisks()) / 2
+	return statInfo{}, nil, reduceReadQuorumErrs(ctx, ignoredErrs, nil, readQuorum)
 }
 
 // deleteXLMetadata - deletes `xl.json` on a single disk.
-func deleteXLMetdata(disk StorageAPI, bucket, prefix string) error {
+func deleteXLMetdata(ctx context.Context, disk StorageAPI, bucket, prefix string) error {
 	jsonFile := path.Join(prefix, xlMetaJSONFile)
-	return errors.Trace(disk.DeleteFile(bucket, jsonFile))
+	err := disk.DeleteFile(bucket, jsonFile)
+	logger.LogIf(ctx, err)
+	return err
 }
 
 // writeXLMetadata - writes `xl.json` to a single disk.
-func writeXLMetadata(disk StorageAPI, bucket, prefix string, xlMeta xlMetaV1) error {
+func writeXLMetadata(ctx context.Context, disk StorageAPI, bucket, prefix string, xlMeta xlMetaV1) error {
 	jsonFile := path.Join(prefix, xlMetaJSONFile)
 
 	// Marshal json.
 	metadataBytes, err := json.Marshal(&xlMeta)
 	if err != nil {
-		return errors.Trace(err)
+		logger.LogIf(ctx, err)
+		return err
 	}
-	// Persist marshalled data.
-	return errors.Trace(disk.AppendFile(bucket, jsonFile, metadataBytes))
+	// Persist marshaled data.
+	err = disk.AppendFile(bucket, jsonFile, metadataBytes)
+	logger.LogIf(ctx, err)
+	return err
 }
 
 // deleteAllXLMetadata - deletes all partially written `xl.json` depending on errs.
-func deleteAllXLMetadata(disks []StorageAPI, bucket, prefix string, errs []error) {
+func deleteAllXLMetadata(ctx context.Context, disks []StorageAPI, bucket, prefix string, errs []error) {
 	var wg = &sync.WaitGroup{}
 	// Delete all the `xl.json` left over.
 	for index, disk := range disks {
@@ -469,29 +484,30 @@ func deleteAllXLMetadata(disks []StorageAPI, bucket, prefix string, errs []error
 			if errs[index] != nil {
 				return
 			}
-			_ = deleteXLMetdata(disk, bucket, prefix)
+			_ = deleteXLMetdata(ctx, disk, bucket, prefix)
 		}(index, disk)
 	}
 	wg.Wait()
 }
 
 // Rename `xl.json` content to destination location for each disk in order.
-func renameXLMetadata(disks []StorageAPI, srcBucket, srcEntry, dstBucket, dstEntry string, quorum int) ([]StorageAPI, error) {
+func renameXLMetadata(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry, dstBucket, dstEntry string, quorum int) ([]StorageAPI, error) {
 	isDir := false
 	srcXLJSON := path.Join(srcEntry, xlMetaJSONFile)
 	dstXLJSON := path.Join(dstEntry, xlMetaJSONFile)
-	return rename(disks, srcBucket, srcXLJSON, dstBucket, dstXLJSON, isDir, quorum)
+	return rename(ctx, disks, srcBucket, srcXLJSON, dstBucket, dstXLJSON, isDir, quorum, []error{errFileNotFound})
 }
 
 // writeUniqueXLMetadata - writes unique `xl.json` content for each disk in order.
-func writeUniqueXLMetadata(disks []StorageAPI, bucket, prefix string, xlMetas []xlMetaV1, quorum int) ([]StorageAPI, error) {
+func writeUniqueXLMetadata(ctx context.Context, disks []StorageAPI, bucket, prefix string, xlMetas []xlMetaV1, quorum int) ([]StorageAPI, error) {
 	var wg = &sync.WaitGroup{}
 	var mErrs = make([]error, len(disks))
 
 	// Start writing `xl.json` to all disks in parallel.
 	for index, disk := range disks {
 		if disk == nil {
-			mErrs[index] = errors.Trace(errDiskNotFound)
+			logger.LogIf(ctx, errDiskNotFound)
+			mErrs[index] = errDiskNotFound
 			continue
 		}
 		wg.Add(1)
@@ -503,7 +519,7 @@ func writeUniqueXLMetadata(disks []StorageAPI, bucket, prefix string, xlMetas []
 			xlMetas[index].Erasure.Index = index + 1
 
 			// Write unique `xl.json` for a disk at index.
-			err := writeXLMetadata(disk, bucket, prefix, xlMetas[index])
+			err := writeXLMetadata(ctx, disk, bucket, prefix, xlMetas[index])
 			if err != nil {
 				mErrs[index] = err
 			}
@@ -513,23 +529,24 @@ func writeUniqueXLMetadata(disks []StorageAPI, bucket, prefix string, xlMetas []
 	// Wait for all the routines.
 	wg.Wait()
 
-	err := reduceWriteQuorumErrs(mErrs, objectOpIgnoredErrs, quorum)
-	if errors.Cause(err) == errXLWriteQuorum {
+	err := reduceWriteQuorumErrs(ctx, mErrs, objectOpIgnoredErrs, quorum)
+	if err == errXLWriteQuorum {
 		// Delete all `xl.json` successfully renamed.
-		deleteAllXLMetadata(disks, bucket, prefix, mErrs)
+		deleteAllXLMetadata(ctx, disks, bucket, prefix, mErrs)
 	}
 	return evalDisks(disks, mErrs), err
 }
 
 // writeSameXLMetadata - write `xl.json` on all disks in order.
-func writeSameXLMetadata(disks []StorageAPI, bucket, prefix string, xlMeta xlMetaV1, writeQuorum int) ([]StorageAPI, error) {
+func writeSameXLMetadata(ctx context.Context, disks []StorageAPI, bucket, prefix string, xlMeta xlMetaV1, writeQuorum int) ([]StorageAPI, error) {
 	var wg = &sync.WaitGroup{}
 	var mErrs = make([]error, len(disks))
 
 	// Start writing `xl.json` to all disks in parallel.
 	for index, disk := range disks {
 		if disk == nil {
-			mErrs[index] = errors.Trace(errDiskNotFound)
+			logger.LogIf(ctx, errDiskNotFound)
+			mErrs[index] = errDiskNotFound
 			continue
 		}
 		wg.Add(1)
@@ -541,7 +558,7 @@ func writeSameXLMetadata(disks []StorageAPI, bucket, prefix string, xlMeta xlMet
 			metadata.Erasure.Index = index + 1
 
 			// Write xl metadata.
-			err := writeXLMetadata(disk, bucket, prefix, metadata)
+			err := writeXLMetadata(ctx, disk, bucket, prefix, metadata)
 			if err != nil {
 				mErrs[index] = err
 			}
@@ -551,10 +568,10 @@ func writeSameXLMetadata(disks []StorageAPI, bucket, prefix string, xlMeta xlMet
 	// Wait for all the routines.
 	wg.Wait()
 
-	err := reduceWriteQuorumErrs(mErrs, objectOpIgnoredErrs, writeQuorum)
-	if errors.Cause(err) == errXLWriteQuorum {
+	err := reduceWriteQuorumErrs(ctx, mErrs, objectOpIgnoredErrs, writeQuorum)
+	if err == errXLWriteQuorum {
 		// Delete all `xl.json` successfully renamed.
-		deleteAllXLMetadata(disks, bucket, prefix, mErrs)
+		deleteAllXLMetadata(ctx, disks, bucket, prefix, mErrs)
 	}
 	return evalDisks(disks, mErrs), err
 }

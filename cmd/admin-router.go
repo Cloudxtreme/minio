@@ -16,57 +16,63 @@
 
 package cmd
 
-import router "github.com/gorilla/mux"
+import (
+	"net/http"
+
+	"github.com/gorilla/mux"
+)
+
+const (
+	adminAPIPathPrefix = "/minio/admin"
+)
 
 // adminAPIHandlers provides HTTP handlers for Minio admin API.
 type adminAPIHandlers struct {
 }
 
 // registerAdminRouter - Add handler functions for each service REST API routes.
-func registerAdminRouter(mux *router.Router) {
+func registerAdminRouter(router *mux.Router) {
 
 	adminAPI := adminAPIHandlers{}
 	// Admin router
-	adminRouter := mux.NewRoute().PathPrefix("/").Subrouter()
+	adminRouter := router.PathPrefix(adminAPIPathPrefix).Subrouter()
+
+	// Version handler
+	adminRouter.Methods(http.MethodGet).Path("/version").HandlerFunc(httpTraceAll(adminAPI.VersionHandler))
+
+	adminV1Router := adminRouter.PathPrefix("/v1").Subrouter()
 
 	/// Service operations
 
 	// Service status
-	adminRouter.Methods("GET").Queries("service", "").Headers(minioAdminOpHeader, "status").HandlerFunc(adminAPI.ServiceStatusHandler)
+	adminV1Router.Methods(http.MethodGet).Path("/service").HandlerFunc(httpTraceAll(adminAPI.ServiceStatusHandler))
 
-	// Service restart
-	adminRouter.Methods("POST").Queries("service", "").Headers(minioAdminOpHeader, "restart").HandlerFunc(adminAPI.ServiceRestartHandler)
-	// Service update credentials
-	adminRouter.Methods("POST").Queries("service", "").Headers(minioAdminOpHeader, "set-credentials").HandlerFunc(adminAPI.ServiceCredentialsHandler)
+	// Service restart and stop - TODO
+	adminV1Router.Methods(http.MethodPost).Path("/service").HandlerFunc(httpTraceAll(adminAPI.ServiceStopNRestartHandler))
 
 	// Info operations
-	adminRouter.Methods("GET").Queries("info", "").HandlerFunc(adminAPI.ServerInfoHandler)
+	adminV1Router.Methods(http.MethodGet).Path("/info").HandlerFunc(httpTraceAll(adminAPI.ServerInfoHandler))
 
 	/// Lock operations
 
 	// List Locks
-	adminRouter.Methods("GET").Queries("lock", "").Headers(minioAdminOpHeader, "list").HandlerFunc(adminAPI.ListLocksHandler)
+	adminV1Router.Methods(http.MethodGet).Path("/locks").HandlerFunc(httpTraceAll(adminAPI.ListLocksHandler))
 	// Clear locks
-	adminRouter.Methods("POST").Queries("lock", "").Headers(minioAdminOpHeader, "clear").HandlerFunc(adminAPI.ClearLocksHandler)
+	adminV1Router.Methods(http.MethodDelete).Path("/locks").HandlerFunc(httpTraceAll(adminAPI.ClearLocksHandler))
 
 	/// Heal operations
 
-	// List Objects needing heal.
-	adminRouter.Methods("GET").Queries("heal", "").Headers(minioAdminOpHeader, "list-objects").HandlerFunc(adminAPI.ListObjectsHealHandler)
-	// List Buckets needing heal.
-	adminRouter.Methods("GET").Queries("heal", "").Headers(minioAdminOpHeader, "list-buckets").HandlerFunc(adminAPI.ListBucketsHealHandler)
-
-	// Heal Buckets.
-	adminRouter.Methods("POST").Queries("heal", "").Headers(minioAdminOpHeader, "bucket").HandlerFunc(adminAPI.HealBucketHandler)
-	// Heal Objects.
-	adminRouter.Methods("POST").Queries("heal", "").Headers(minioAdminOpHeader, "object").HandlerFunc(adminAPI.HealObjectHandler)
-	// Heal Format.
-	adminRouter.Methods("POST").Queries("heal", "").Headers(minioAdminOpHeader, "format").HandlerFunc(adminAPI.HealFormatHandler)
+	// Heal processing endpoint.
+	adminV1Router.Methods(http.MethodPost).Path("/heal/").HandlerFunc(httpTraceAll(adminAPI.HealHandler))
+	adminV1Router.Methods(http.MethodPost).Path("/heal/{bucket}").HandlerFunc(httpTraceAll(adminAPI.HealHandler))
+	adminV1Router.Methods(http.MethodPost).Path("/heal/{bucket}/{prefix:.*}").HandlerFunc(httpTraceAll(adminAPI.HealHandler))
 
 	/// Config operations
 
+	// Update credentials
+	adminV1Router.Methods(http.MethodPut).Path("/config/credential").HandlerFunc(httpTraceAll(adminAPI.UpdateCredentialsHandler))
 	// Get config
-	adminRouter.Methods("GET").Queries("config", "").Headers(minioAdminOpHeader, "get").HandlerFunc(adminAPI.GetConfigHandler)
-	// Set Config
-	adminRouter.Methods("PUT").Queries("config", "").Headers(minioAdminOpHeader, "set").HandlerFunc(adminAPI.SetConfigHandler)
+	adminV1Router.Methods(http.MethodGet).Path("/config").HandlerFunc(httpTraceAll(adminAPI.GetConfigHandler))
+	// Set config
+	adminV1Router.Methods(http.MethodPut).Path("/config").HandlerFunc(httpTraceAll(adminAPI.SetConfigHandler))
 }

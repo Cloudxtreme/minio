@@ -37,12 +37,15 @@ go run generate_cert.go -ca --host "10.10.0.3"
 
 1. **ECDSA:**  
 ```sh
-openssl ecparam -genkey -name prime256v1 -out private.key
+openssl ecparam -genkey -name prime256v1 | openssl ec -out private.key
 ```
 or protect the private key additionally with a password:  
 ```sh
 openssl ecparam -genkey -name prime256v1 | openssl ec -aes256 -out private.key -passout pass:PASSWORD
 ```
+
+Notice that the NIST curves P-384 and P-521 are not supported yet.
+
 2. **RSA:**
 ```sh
 openssl genrsa -out private.key 2048
@@ -58,10 +61,25 @@ export MINIO_CERT_PASSWD=PASSWORD
 ``` 
 Please use your own password instead of PASSWORD.
 
+**Notice:**  
+The OpenSSL default format for encrypted private keys is PKCS-8. Minio only supports PKCS-1 encrypted private keys.
+An encrypted private PKCS-8 formated RSA key can be converted to an encrypted private PKCS-1 formated RSA key by:
+```sh
+openssl rsa -in private-pkcs8-key.key -aes256 -passout pass:PASSWORD -out private.key
+```  
+
 **Generate the self-signed certificate**:
 
+Generate self-signed certificate using the below command (remember to replace `<domain.com>` with your actual domain name)
+
 ```sh
-openssl req -new -x509 -days 3650 -key private.key -out public.crt -subj "/C=US/ST=state/L=location/O=organization/CN=domain"
+openssl req -new -x509 -days 3650 -key private.key -out public.crt -subj "/C=US/ST=state/L=location/O=organization/CN=<domain.com>"
+```
+
+Generate self-signed wildcard certificate using the below command. This certificate will be valid for all the sub-domains under `domain.com`. Wildcard certificates come in handy while deploying distributed Minio instances where there may be multiple sub-domains under a single domain, with each one running a separate Minio instance.
+
+```sh
+openssl req -new -x509 -days 3650 -key private.key -out public.crt -subj "/C=US/ST=state/L=location/O=organization/CN=<*.domain.com>"
 ```
 
 ### Using OpenSSL (with IP address)
@@ -166,6 +184,7 @@ certtool.exe --generate-self-signed --load-privkey private.key --template cert.c
 Minio can be configured to connect to other servers, whether Minio nodes or servers like NATs, Redis. If these servers use certificates that are not registered in one of the known certificates authorities, you can make Minio server trust these CAs by dropping these certificates under Minio config path (`~/.minio/certs/CAs/` on Linux or `C:\Users\<Username>\.minio\certs\CAs` on Windows).
 
 # Explore Further
+* [TLS Configuration for Minio server on Kubernetes](https://github.com/minio/minio/tree/master/docs/tls/kubernetes)
 * [Minio Client Complete Guide](https://docs.minio.io/docs/minio-client-complete-guide)
 * [Generate Let's Encrypt Certificate](https://docs.minio.io/docs/generate-let-s-encypt-certificate-using-concert-for-minio)
-* [Setup Nginx Proxy with Minio Server](https://docs.minio.io/docs/setup-nginx-proxy-with-minio)
+* [Setup nginx Proxy with Minio Server](https://docs.minio.io/docs/setup-nginx-proxy-with-minio)

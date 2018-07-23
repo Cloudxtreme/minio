@@ -17,15 +17,14 @@
 package azure
 
 import (
+	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"reflect"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/storage"
 	minio "github.com/minio/minio/cmd"
-	"github.com/minio/minio/pkg/errors"
 )
 
 // Test canonical metadata.
@@ -56,7 +55,7 @@ func TestS3MetaToAzureProperties(t *testing.T) {
 		"X_Amz_Matdesc":    "{}",
 		"X_Amz_Iv":         "eWmyryl8kq+EVnnsE7jpOg==",
 	}
-	meta, _, err := s3MetaToAzureProperties(headers)
+	meta, _, err := s3MetaToAzureProperties(context.Background(), headers)
 	if err != nil {
 		t.Fatalf("Test failed, with %s", err)
 	}
@@ -66,8 +65,8 @@ func TestS3MetaToAzureProperties(t *testing.T) {
 	headers = map[string]string{
 		"invalid--meta": "value",
 	}
-	_, _, err = s3MetaToAzureProperties(headers)
-	if err = errors.Cause(err); err != nil {
+	_, _, err = s3MetaToAzureProperties(context.Background(), headers)
+	if err != nil {
 		if _, ok := err.(minio.UnsupportedMetadata); !ok {
 			t.Fatalf("Test failed with unexpected error %s, expected UnsupportedMetadata", err)
 		}
@@ -76,7 +75,7 @@ func TestS3MetaToAzureProperties(t *testing.T) {
 	headers = map[string]string{
 		"content-md5": "Dce7bmCX61zvxzP5QmfelQ==",
 	}
-	_, props, err := s3MetaToAzureProperties(headers)
+	_, props, err := s3MetaToAzureProperties(context.Background(), headers)
 	if err != nil {
 		t.Fatalf("Test failed, with %s", err)
 	}
@@ -138,53 +137,46 @@ func TestAzureToObjectError(t *testing.T) {
 			nil, nil, "", "",
 		},
 		{
-			errors.Trace(fmt.Errorf("Non azure error")),
+			fmt.Errorf("Non azure error"),
 			fmt.Errorf("Non azure error"), "", "",
 		},
 		{
 			storage.AzureStorageServiceError{
 				Code: "ContainerAlreadyExists",
-			}, storage.AzureStorageServiceError{
-				Code: "ContainerAlreadyExists",
-			}, "bucket", "",
+			}, minio.BucketExists{Bucket: "bucket"}, "bucket", "",
 		},
 		{
-			errors.Trace(storage.AzureStorageServiceError{
-				Code: "ContainerAlreadyExists",
-			}), minio.BucketExists{Bucket: "bucket"}, "bucket", "",
-		},
-		{
-			errors.Trace(storage.AzureStorageServiceError{
+			storage.AzureStorageServiceError{
 				Code: "InvalidResourceName",
-			}), minio.BucketNameInvalid{Bucket: "bucket."}, "bucket.", "",
+			}, minio.BucketNameInvalid{Bucket: "bucket."}, "bucket.", "",
 		},
 		{
-			errors.Trace(storage.AzureStorageServiceError{
+			storage.AzureStorageServiceError{
 				Code: "RequestBodyTooLarge",
-			}), minio.PartTooBig{}, "", "",
+			}, minio.PartTooBig{}, "", "",
 		},
 		{
-			errors.Trace(storage.AzureStorageServiceError{
+			storage.AzureStorageServiceError{
 				Code: "InvalidMetadata",
-			}), minio.UnsupportedMetadata{}, "", "",
+			}, minio.UnsupportedMetadata{}, "", "",
 		},
 		{
-			errors.Trace(storage.AzureStorageServiceError{
+			storage.AzureStorageServiceError{
 				StatusCode: http.StatusNotFound,
-			}), minio.ObjectNotFound{
+			}, minio.ObjectNotFound{
 				Bucket: "bucket",
 				Object: "object",
 			}, "bucket", "object",
 		},
 		{
-			errors.Trace(storage.AzureStorageServiceError{
+			storage.AzureStorageServiceError{
 				StatusCode: http.StatusNotFound,
-			}), minio.BucketNotFound{Bucket: "bucket"}, "bucket", "",
+			}, minio.BucketNotFound{Bucket: "bucket"}, "bucket", "",
 		},
 		{
-			errors.Trace(storage.AzureStorageServiceError{
+			storage.AzureStorageServiceError{
 				StatusCode: http.StatusBadRequest,
-			}), minio.BucketNameInvalid{Bucket: "bucket."}, "bucket.", "",
+			}, minio.BucketNameInvalid{Bucket: "bucket."}, "bucket.", "",
 		},
 	}
 	for i, testCase := range testCases {
@@ -262,56 +254,6 @@ func TestAzureParseBlockID(t *testing.T) {
 	}
 }
 
-// Test azureListBlobsGetParameters()
-func TestAzureListBlobsGetParameters(t *testing.T) {
-
-	// Test values set 1
-	expectedURLValues := url.Values{}
-	expectedURLValues.Set("prefix", "test")
-	expectedURLValues.Set("delimiter", "_")
-	expectedURLValues.Set("marker", "marker")
-	expectedURLValues.Set("include", "metadata")
-	expectedURLValues.Set("maxresults", "20")
-	expectedURLValues.Set("timeout", "10")
-
-	setBlobParameters := storage.ListBlobsParameters{
-		Prefix:     "test",
-		Delimiter:  "_",
-		Marker:     "marker",
-		Include:    &storage.IncludeBlobDataset{Metadata: true},
-		MaxResults: 20,
-		Timeout:    10,
-	}
-
-	// Test values set 2
-	expectedURLValues1 := url.Values{}
-
-	setBlobParameters1 := storage.ListBlobsParameters{
-		Prefix:     "",
-		Delimiter:  "",
-		Marker:     "",
-		Include:    nil,
-		MaxResults: 0,
-		Timeout:    0,
-	}
-
-	testCases := []struct {
-		name string
-		args storage.ListBlobsParameters
-		want url.Values
-	}{
-		{"TestIfValuesSet", setBlobParameters, expectedURLValues},
-		{"TestIfValuesNotSet", setBlobParameters1, expectedURLValues1},
-	}
-	for _, test := range testCases {
-		t.Run(test.name, func(t *testing.T) {
-			if got := azureListBlobsGetParameters(test.args); !reflect.DeepEqual(got, test.want) {
-				t.Errorf("azureListBlobsGetParameters() = %v, want %v", got, test.want)
-			}
-		})
-	}
-}
-
 func TestAnonErrToObjectErr(t *testing.T) {
 	testCases := []struct {
 		name       string
@@ -358,7 +300,7 @@ func TestCheckAzureUploadID(t *testing.T) {
 	}
 
 	for _, uploadID := range invalidUploadIDs {
-		if err := checkAzureUploadID(uploadID); err == nil {
+		if err := checkAzureUploadID(context.Background(), uploadID); err == nil {
 			t.Fatalf("%s: expected: <error>, got: <nil>", uploadID)
 		}
 	}
@@ -369,7 +311,7 @@ func TestCheckAzureUploadID(t *testing.T) {
 	}
 
 	for _, uploadID := range validUploadIDs {
-		if err := checkAzureUploadID(uploadID); err != nil {
+		if err := checkAzureUploadID(context.Background(), uploadID); err != nil {
 			t.Fatalf("%s: expected: <nil>, got: %s", uploadID, err)
 		}
 	}

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/xml"
@@ -35,6 +36,7 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
+	"github.com/minio/minio/pkg/policy"
 )
 
 // API suite container common to both FS and XL.
@@ -75,15 +77,10 @@ func verifyError(c *check, response *http.Response, code, description string, st
 
 func runAllTests(suite *TestSuiteCommon, c *check) {
 	suite.SetUpSuite(c)
-	suite.TestBucketSQSNotificationWebHook(c)
-	if suite.serverType == "XL" {
-		suite.TestObjectDir(c)
-	}
-	suite.TestBucketSQSNotificationAMQP(c)
+	suite.TestObjectDir(c)
 	suite.TestBucketPolicy(c)
 	suite.TestDeleteBucket(c)
 	suite.TestDeleteBucketNotEmpty(c)
-	suite.TestListenBucketNotificationHandler(c)
 	suite.TestDeleteMultipleObjects(c)
 	suite.TestDeleteObject(c)
 	suite.TestNonExistentBucket(c)
@@ -128,23 +125,27 @@ func runAllTests(suite *TestSuiteCommon, c *check) {
 func TestServerSuite(t *testing.T) {
 	testCases := []*TestSuiteCommon{
 		// Init and run test on FS backend with signature v4.
-		&TestSuiteCommon{serverType: "FS", signer: signerV4},
+		{serverType: "FS", signer: signerV4},
 		// Init and run test on FS backend with signature v2.
-		&TestSuiteCommon{serverType: "FS", signer: signerV2},
+		{serverType: "FS", signer: signerV2},
 		// Init and run test on FS backend, with tls enabled.
-		&TestSuiteCommon{serverType: "FS", signer: signerV4, secure: true},
+		{serverType: "FS", signer: signerV4, secure: true},
 		// Init and run test on XL backend.
-		&TestSuiteCommon{serverType: "XL", signer: signerV4},
+		{serverType: "XL", signer: signerV4},
+		// Init and run test on XLSet backend.
+		{serverType: "XLSet", signer: signerV4},
 	}
-	for _, testCase := range testCases {
-		runAllTests(testCase, &check{t, testCase.serverType})
+	for i, testCase := range testCases {
+		t.Run(fmt.Sprintf("Test: %d, ServerType: %s", i+1, testCase.serverType), func(t *testing.T) {
+			runAllTests(testCase, &check{t, testCase.serverType})
+		})
 	}
 }
 
 // Setting up the test suite.
 // Starting the Test server with temporary FS backend.
 func (s *TestSuiteCommon) SetUpSuite(c *check) {
-	rootPath, err := newTestConfig("us-east-1")
+	rootPath, err := newTestConfig(globalMinioDefaultRegion)
 	c.Assert(err, nil)
 
 	if s.secure {
@@ -260,7 +261,7 @@ func (s *TestSuiteCommon) TestObjectDir(c *check) {
 	response, err = client.Do(request)
 
 	c.Assert(err, nil)
-	c.Assert(response.StatusCode, http.StatusNotFound)
+	c.Assert(response.StatusCode, http.StatusOK)
 
 	request, err = newTestSignedRequest("GET", getGetObjectURL(s.endPoint, bucketName, "my-object-directory/"),
 		0, nil, s.accessKey, s.secretKey, s.signer)
@@ -271,7 +272,7 @@ func (s *TestSuiteCommon) TestObjectDir(c *check) {
 	response, err = client.Do(request)
 
 	c.Assert(err, nil)
-	c.Assert(response.StatusCode, http.StatusNotFound)
+	c.Assert(response.StatusCode, http.StatusOK)
 
 	request, err = newTestSignedRequest("DELETE", getDeleteObjectURL(s.endPoint, bucketName, "my-object-directory/"),
 		0, nil, s.accessKey, s.secretKey, s.signer)
@@ -319,7 +320,7 @@ func (s *TestSuiteCommon) TestBucketSQSNotificationAMQP(c *check) {
 // Deletes the policy and verifies the deletion by fetching it back.
 func (s *TestSuiteCommon) TestBucketPolicy(c *check) {
 	// Sample bucket policy.
-	bucketPolicyBuf := `{"Version":"2012-10-17","Statement":[{"Action":["s3:GetBucketLocation","s3:ListBucket"],"Effect":"Allow","Principal":{"AWS":["*"]},"Resource":["arn:aws:s3:::%s"],"Sid":""},{"Action":["s3:GetObject"],"Effect":"Allow","Principal":{"AWS":["*"]},"Resource":["arn:aws:s3:::%s/this*"],"Sid":""}]}`
+	bucketPolicyBuf := `{"Version":"2012-10-17","Statement":[{"Action":["s3:GetBucketLocation","s3:ListBucket"],"Effect":"Allow","Principal":{"AWS":["*"]},"Resource":["arn:aws:s3:::%s"]},{"Action":["s3:GetObject"],"Effect":"Allow","Principal":{"AWS":["*"]},"Resource":["arn:aws:s3:::%s/this*"]}]}`
 
 	// generate a random bucket Name.
 	bucketName := getRandomBucketName()
@@ -361,7 +362,11 @@ func (s *TestSuiteCommon) TestBucketPolicy(c *check) {
 	bucketPolicyReadBuf, err := ioutil.ReadAll(response.Body)
 	c.Assert(err, nil)
 	// Verify if downloaded policy matches with previousy uploaded.
-	c.Assert(bytes.Equal([]byte(bucketPolicyStr), bucketPolicyReadBuf), true)
+	expectedPolicy, err := policy.ParseConfig(strings.NewReader(bucketPolicyStr), bucketName)
+	c.Assert(err, nil)
+	gotPolicy, err := policy.ParseConfig(bytes.NewReader(bucketPolicyReadBuf), bucketName)
+	c.Assert(err, nil)
+	c.Assert(reflect.DeepEqual(expectedPolicy, gotPolicy), true)
 
 	// Delete policy.
 	request, err = newTestSignedRequest("DELETE", getDeletePolicyURL(s.endPoint, bucketName), 0, nil,
@@ -638,7 +643,7 @@ func (s *TestSuiteCommon) TestDeleteObject(c *check) {
 	// assert the status of http response.
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	// object name was "prefix/myobject", an attempt to delelte "prefix"
+	// object name was "prefix/myobject", an attempt to delete "prefix"
 	// Should not delete "prefix/myobject"
 	request, err = newTestSignedRequest("DELETE", getDeleteObjectURL(s.endPoint, bucketName, "prefix"),
 		0, nil, s.accessKey, s.secretKey, s.signer)
@@ -2415,7 +2420,7 @@ func (s *TestSuiteCommon) TestBucketMultipartList(c *check) {
 	// unmarshalling works from a client perspective, specifically
 	// while unmarshalling time.Time type for 'Initiated' field.
 	// time.Time does not honor xml marshaler, it means that we need
-	// to encode/format it before giving it to xml marshalling.
+	// to encode/format it before giving it to xml marshaling.
 
 	// This below check adds client side verification to see if its
 	// truly parseable.
@@ -2733,7 +2738,7 @@ func (s *TestSuiteCommon) TestObjectMultipart(c *check) {
 		part.ETag = canonicalizeETag(part.ETag)
 		parts = append(parts, part)
 	}
-	etag, err := getCompleteMultipartMD5(parts)
+	etag, err := getCompleteMultipartMD5(context.Background(), parts)
 	c.Assert(err, nil)
 	c.Assert(canonicalizeETag(response.Header.Get("Etag")), etag)
 }

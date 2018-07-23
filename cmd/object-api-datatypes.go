@@ -16,7 +16,13 @@
 
 package cmd
 
-import "time"
+import (
+	"io"
+	"time"
+
+	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/madmin"
+)
 
 // BackendType - represents different backend types.
 type BackendType int
@@ -33,10 +39,8 @@ const (
 
 // StorageInfo - represents total capacity of underlying storage.
 type StorageInfo struct {
-	// Total disk space.
-	Total uint64
-	// Free available disk space.
-	Free uint64
+	Used uint64 // Used total used per tenant.
+
 	// Backend type.
 	Backend struct {
 		// Represents various backend types, currently on FS and Erasure.
@@ -45,24 +49,14 @@ type StorageInfo struct {
 		// Following fields are only meaningful if BackendType is Erasure.
 		OnlineDisks      int // Online disks during server startup.
 		OfflineDisks     int // Offline disks during server startup.
+		StandardSCData   int // Data disks for currently configured Standard storage class.
 		StandardSCParity int // Parity disks for currently configured Standard storage class.
+		RRSCData         int // Data disks for currently configured Reduced Redundancy storage class.
 		RRSCParity       int // Parity disks for currently configured Reduced Redundancy storage class.
+
+		// List of all disk status, this is only meaningful if BackendType is Erasure.
+		Sets [][]madmin.DriveInfo
 	}
-}
-
-type healStatus int
-
-const (
-	healthy           healStatus = iota // Object is healthy
-	canHeal                             // Object can be healed
-	corrupted                           // Object can't be healed
-	quorumUnavailable                   // Object can't be healed until read quorum is available
-	canPartiallyHeal                    // Object can't be healed completely until outdated disk(s) are online.
-)
-
-// HealBucketInfo - represents healing related information of a bucket.
-type HealBucketInfo struct {
-	Status healStatus
 }
 
 // BucketInfo - represents bucket metadata.
@@ -72,16 +66,6 @@ type BucketInfo struct {
 
 	// Date and time when the bucket was created.
 	Created time.Time
-
-	// Healing information
-	HealBucketInfo *HealBucketInfo `xml:"HealBucketInfo,omitempty"`
-}
-
-// HealObjectInfo - represents healing related information of an object.
-type HealObjectInfo struct {
-	Status             healStatus
-	MissingDataCount   int
-	MissingParityCount int
 }
 
 // ObjectInfo - represents object metadata.
@@ -112,9 +96,21 @@ type ObjectInfo struct {
 	// by the Content-Type header field.
 	ContentEncoding string
 
+	// Specify object storage class
+	StorageClass string
+
 	// User-Defined metadata
-	UserDefined    map[string]string
-	HealObjectInfo *HealObjectInfo `xml:"HealObjectInfo,omitempty"`
+	UserDefined map[string]string
+
+	// List of individual parts, maximum size of upto 10,000
+	Parts []objectPartInfo `json:"-"`
+
+	// Implements writer and reader used by CopyObject API
+	Writer       io.WriteCloser `json:"-"`
+	Reader       *hash.Reader   `json:"-"`
+	metadataOnly bool
+	// Date and time when the object was last accessed.
+	AccTime time.Time
 }
 
 // ListPartsInfo - represents list of all parts.
@@ -147,6 +143,9 @@ type ListPartsInfo struct {
 
 	// List of all parts.
 	Parts []PartInfo
+
+	// Any metadata set during InitMultipartUpload, including encryption headers.
+	UserDefined map[string]string
 
 	EncodingType string // Not supported yet.
 }
@@ -273,8 +272,6 @@ type MultipartInfo struct {
 	Initiated time.Time
 
 	StorageClass string // Not supported yet.
-
-	HealUploadInfo *HealObjectInfo `xml:"HealUploadInfo,omitempty"`
 }
 
 // CompletePart - represents the part that was completed, this is sent by the client

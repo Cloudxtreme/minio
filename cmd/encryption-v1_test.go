@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,32 @@ import (
 	"testing"
 )
 
-var isSSECustomerRequestTests = []struct {
+var hasSSECopyCustomerHeaderTests = []struct {
+	headers    map[string]string
+	sseRequest bool
+}{
+	{headers: map[string]string{SSECopyCustomerAlgorithm: "AES256", SSECopyCustomerKey: "key", SSECopyCustomerKeyMD5: "md5"}, sseRequest: true},                    // 0
+	{headers: map[string]string{SSECopyCustomerAlgorithm: "AES256"}, sseRequest: true},                                                                             // 1
+	{headers: map[string]string{SSECopyCustomerKey: "key"}, sseRequest: true},                                                                                      // 2
+	{headers: map[string]string{SSECopyCustomerKeyMD5: "md5"}, sseRequest: true},                                                                                   // 3
+	{headers: map[string]string{}, sseRequest: false},                                                                                                              // 4
+	{headers: map[string]string{SSECopyCustomerAlgorithm + " ": "AES256", " " + SSECopyCustomerKey: "key", SSECopyCustomerKeyMD5 + " ": "md5"}, sseRequest: false}, // 5
+	{headers: map[string]string{SSECopyCustomerAlgorithm: "", SSECopyCustomerKey: "", SSECopyCustomerKeyMD5: ""}, sseRequest: false},                               // 6
+}
+
+func TestIsSSECopyCustomerRequest(t *testing.T) {
+	for i, test := range hasSSECopyCustomerHeaderTests {
+		headers := http.Header{}
+		for k, v := range test.headers {
+			headers.Set(k, v)
+		}
+		if hasSSECopyCustomerHeader(headers) != test.sseRequest {
+			t.Errorf("Test %d: Expected hasSSECopyCustomerHeader to return %v", i, test.sseRequest)
+		}
+	}
+}
+
+var hasSSECustomerHeaderTests = []struct {
 	headers    map[string]string
 	sseRequest bool
 }{
@@ -35,14 +60,14 @@ var isSSECustomerRequestTests = []struct {
 	{headers: map[string]string{SSECustomerAlgorithm: "", SSECustomerKey: "", SSECustomerKeyMD5: ""}, sseRequest: false},                               // 6
 }
 
-func TestIsSSECustomerRequest(t *testing.T) {
-	for i, test := range isSSECustomerRequestTests {
+func TesthasSSECustomerHeader(t *testing.T) {
+	for i, test := range hasSSECustomerHeaderTests {
 		headers := http.Header{}
 		for k, v := range test.headers {
 			headers.Set(k, v)
 		}
-		if IsSSECustomerRequest(headers) != test.sseRequest {
-			t.Errorf("Test %d: Expected IsSSECustomerRequest to return %v", i, test.sseRequest)
+		if hasSSECustomerHeader(headers) != test.sseRequest {
+			t.Errorf("Test %d: Expected hasSSECustomerHeader to return %v", i, test.sseRequest)
 		}
 	}
 }
@@ -145,58 +170,107 @@ func TestParseSSECustomerRequest(t *testing.T) {
 		if (err == nil || err == errSSEKeyMD5Mismatch) && key != "" {
 			t.Errorf("Test %d: Client key survived parsing - found key: %v", i, key)
 		}
+
 	}
 }
 
-var encryptedSizeTests = []struct {
-	size, encsize int64
+var parseSSECopyCustomerRequestTests = []struct {
+	headers map[string]string
+	useTLS  bool
+	err     error
 }{
-	{size: 0, encsize: 0},                                           // 0
-	{size: 1, encsize: 33},                                          // 1
-	{size: 1024, encsize: 1024 + 32},                                // 2
-	{size: 2 * 64 * 1024, encsize: 2 * (64*1024 + 32)},              // 3
-	{size: 100*64*1024 + 1, encsize: 100*(64*1024+32) + 33},         // 4
-	{size: 64*1024 + 1, encsize: (64*1024 + 32) + 33},               // 5
-	{size: 5 * 1024 * 1024 * 1024, encsize: 81920 * (64*1024 + 32)}, // 6
+	{
+		headers: map[string]string{
+			SSECopyCustomerAlgorithm: "AES256",
+			SSECopyCustomerKey:       "XAm0dRrJsEsyPb1UuFNezv1bl9hxuYsgUVC/MUctE2k=", // 0
+			SSECopyCustomerKeyMD5:    "bY4wkxQejw9mUJfo72k53A==",
+		},
+		useTLS: true, err: nil,
+	},
+	{
+		headers: map[string]string{
+			SSECopyCustomerAlgorithm: "AES256",
+			SSECopyCustomerKey:       "XAm0dRrJsEsyPb1UuFNezv1bl9hxuYsgUVC/MUctE2k=", // 1
+			SSECopyCustomerKeyMD5:    "bY4wkxQejw9mUJfo72k53A==",
+		},
+		useTLS: false, err: errInsecureSSERequest,
+	},
+	{
+		headers: map[string]string{
+			SSECopyCustomerAlgorithm: "AES 256",
+			SSECopyCustomerKey:       "XAm0dRrJsEsyPb1UuFNezv1bl9hxuYsgUVC/MUctE2k=", // 2
+			SSECopyCustomerKeyMD5:    "bY4wkxQejw9mUJfo72k53A==",
+		},
+		useTLS: true, err: errInvalidSSEAlgorithm,
+	},
+	{
+		headers: map[string]string{
+			SSECopyCustomerAlgorithm: "AES256",
+			SSECopyCustomerKey:       "NjE0SL87s+ZhYtaTrg5eI5cjhCQLGPVMKenPG2bCJFw=", // 3
+			SSECopyCustomerKeyMD5:    "H+jq/LwEOEO90YtiTuNFVw==",
+		},
+		useTLS: true, err: errSSEKeyMD5Mismatch,
+	},
+	{
+		headers: map[string]string{
+			SSECopyCustomerAlgorithm: "AES256",
+			SSECopyCustomerKey:       " jE0SL87s+ZhYtaTrg5eI5cjhCQLGPVMKenPG2bCJFw=", // 4
+			SSECopyCustomerKeyMD5:    "H+jq/LwEOEO90YtiTuNFVw==",
+		},
+		useTLS: true, err: errInvalidSSEKey,
+	},
+	{
+		headers: map[string]string{
+			SSECopyCustomerAlgorithm: "AES256",
+			SSECopyCustomerKey:       "NjE0SL87s+ZhYtaTrg5eI5cjhCQLGPVMKenPG2bCJFw=", // 5
+			SSECopyCustomerKeyMD5:    " +jq/LwEOEO90YtiTuNFVw==",
+		},
+		useTLS: true, err: errSSEKeyMD5Mismatch,
+	},
+	{
+		headers: map[string]string{
+			SSECopyCustomerAlgorithm: "AES256",
+			SSECopyCustomerKey:       "vFQ9ScFOF6Tu/BfzMS+rVMvlZGJHi5HmGJenJfrfKI45", // 6
+			SSECopyCustomerKeyMD5:    "9KPgDdZNTHimuYCwnJTp5g==",
+		},
+		useTLS: true, err: errInvalidSSEKey,
+	},
+	{
+		headers: map[string]string{
+			SSECopyCustomerAlgorithm: "AES256",
+			SSECopyCustomerKey:       "", // 7
+			SSECopyCustomerKeyMD5:    "9KPgDdZNTHimuYCwnJTp5g==",
+		},
+		useTLS: true, err: errMissingSSEKey,
+	},
+	{
+		headers: map[string]string{
+			SSECopyCustomerAlgorithm: "AES256",
+			SSECopyCustomerKey:       "vFQ9ScFOF6Tu/BfzMS+rVMvlZGJHi5HmGJenJfrfKI45", // 8
+			SSECopyCustomerKeyMD5:    "",
+		},
+		useTLS: true, err: errMissingSSEKeyMD5,
+	},
 }
 
-func TestEncryptedSize(t *testing.T) {
-	for i, test := range encryptedSizeTests {
-		objInfo := ObjectInfo{Size: test.size}
-		if size := objInfo.EncryptedSize(); test.encsize != size {
-			t.Errorf("Test %d: got encrypted size: #%d want: #%d", i, size, test.encsize)
+func TestParseSSECopyCustomerRequest(t *testing.T) {
+	defer func(flag bool) { globalIsSSL = flag }(globalIsSSL)
+	for i, test := range parseSSECopyCustomerRequestTests {
+		headers := http.Header{}
+		for k, v := range test.headers {
+			headers.Set(k, v)
 		}
-	}
-}
+		request := &http.Request{}
+		request.Header = headers
+		globalIsSSL = test.useTLS
 
-var decryptSSECustomerObjectInfoTests = []struct {
-	encsize, size int64
-	err           error
-}{
-	{encsize: 0, size: 0, err: nil},                                           // 0
-	{encsize: 33, size: 1, err: nil},                                          // 1
-	{encsize: 1024 + 32, size: 1024, err: nil},                                // 2
-	{encsize: 2 * (64*1024 + 32), size: 2 * 64 * 1024, err: nil},              // 3
-	{encsize: 100*(64*1024+32) + 33, size: 100*64*1024 + 1, err: nil},         // 4
-	{encsize: (64*1024 + 32) + 33, size: 64*1024 + 1, err: nil},               // 5
-	{encsize: 81920 * (64*1024 + 32), size: 5 * 1024 * 1024 * 1024, err: nil}, // 6
-	{encsize: 0, size: 0, err: nil},                                           // 7
-	{encsize: 64*1024 + 32 + 31, size: 0, err: errObjectTampered},             // 8
-}
-
-func TestDecryptedSize(t *testing.T) {
-	for i, test := range decryptSSECustomerObjectInfoTests {
-		objInfo := ObjectInfo{Size: test.encsize}
-		objInfo.UserDefined = map[string]string{
-			ServerSideEncryptionSealAlgorithm: SSESealAlgorithmDareSha256,
+		_, err := ParseSSECopyCustomerRequest(request)
+		if err != test.err {
+			t.Errorf("Test %d: Parse returned: %v want: %v", i, err, test.err)
 		}
-
-		size, err := objInfo.DecryptedSize()
-		if err != test.err || (size != test.size && err == nil) {
-			t.Errorf("Test %d: decryption returned: %v want: %v", i, err, test.err)
-		}
-		if err == nil && size != test.size {
-			t.Errorf("Test %d: got decrypted size: #%d want: #%d", i, size, test.size)
+		key := request.Header.Get(SSECopyCustomerKey)
+		if (err == nil || err == errSSEKeyMD5Mismatch) && key != "" {
+			t.Errorf("Test %d: Client key survived parsing - found key: %v", i, key)
 		}
 	}
 }
@@ -234,7 +308,7 @@ func TestEncryptRequest(t *testing.T) {
 		for k, v := range test.header {
 			req.Header.Set(k, v)
 		}
-		_, err := EncryptRequest(content, req, test.metadata)
+		_, err := EncryptRequest(content, req, "bucket", "object", test.metadata)
 		if err != nil {
 			t.Fatalf("Test %d: Failed to encrypt request: %v", i, err)
 		}
@@ -254,11 +328,14 @@ func TestEncryptRequest(t *testing.T) {
 }
 
 var decryptRequestTests = []struct {
-	header     map[string]string
-	metadata   map[string]string
-	shouldFail bool
+	bucket, object string
+	header         map[string]string
+	metadata       map[string]string
+	shouldFail     bool
 }{
 	{
+		bucket: "bucket",
+		object: "object",
 		header: map[string]string{
 			SSECustomerAlgorithm: "AES256",
 			SSECustomerKey:       "MzJieXRlc2xvbmdzZWNyZXRrZXltdXN0cHJvdmlkZWQ=",
@@ -272,6 +349,23 @@ var decryptRequestTests = []struct {
 		shouldFail: false,
 	},
 	{
+		bucket: "bucket",
+		object: "object",
+		header: map[string]string{
+			SSECustomerAlgorithm: "AES256",
+			SSECustomerKey:       "MzJieXRlc2xvbmdzZWNyZXRrZXltdXN0cHJvdmlkZWQ=",
+			SSECustomerKeyMD5:    "7PpPLAK26ONlVUGOWlusfg==",
+		},
+		metadata: map[string]string{
+			ServerSideEncryptionSealAlgorithm: SSESealAlgorithmDareV2HmacSha256,
+			ServerSideEncryptionIV:            "qEqmsONcorqlcZXJxaw32H04eyXyXwUgjHzlhkaIYrU=",
+			ServerSideEncryptionSealedKey:     "IAAfAIM14ugTGcM/dIrn4iQMrkl1sjKyeBQ8FBEvRebYj8vWvxG+0cJRpC6NXRU1wJN50JaUOATjO7kz0wZ2mA==",
+		},
+		shouldFail: false,
+	},
+	{
+		bucket: "bucket",
+		object: "object",
 		header: map[string]string{
 			SSECustomerAlgorithm: "AES256",
 			SSECustomerKey:       "XAm0dRrJsEsyPb1UuFNezv1bl9hxuYsgUVC/MUctE2k=",
@@ -285,6 +379,8 @@ var decryptRequestTests = []struct {
 		shouldFail: true,
 	},
 	{
+		bucket: "bucket",
+		object: "object",
 		header: map[string]string{
 			SSECustomerAlgorithm: "AES256",
 			SSECustomerKey:       "XAm0dRrJsEsyPb1UuFNezv1bl9hxuYsgUVC/MUctE2k=",
@@ -298,6 +394,8 @@ var decryptRequestTests = []struct {
 		shouldFail: true,
 	},
 	{
+		bucket: "bucket",
+		object: "object",
 		header: map[string]string{
 			SSECustomerAlgorithm: "AES256",
 			SSECustomerKey:       "XAm0dRrJsEsyPb1UuFNezv1bl9hxuYsgUVC/MUctE2k=",
@@ -310,20 +408,38 @@ var decryptRequestTests = []struct {
 		},
 		shouldFail: true,
 	},
+	{
+		bucket: "bucket",
+		object: "object-2",
+		header: map[string]string{
+			SSECustomerAlgorithm: "AES256",
+			SSECustomerKey:       "MzJieXRlc2xvbmdzZWNyZXRrZXltdXN0cHJvdmlkZWQ=",
+			SSECustomerKeyMD5:    "7PpPLAK26ONlVUGOWlusfg==",
+		},
+		metadata: map[string]string{
+			ServerSideEncryptionSealAlgorithm: SSESealAlgorithmDareV2HmacSha256,
+			ServerSideEncryptionIV:            "qEqmsONcorqlcZXJxaw32H04eyXyXwUgjHzlhkaIYrU=",
+			ServerSideEncryptionSealedKey:     "IAAfAIM14ugTGcM/dIrn4iQMrkl1sjKyeBQ8FBEvRebYj8vWvxG+0cJRpC6NXRU1wJN50JaUOATjO7kz0wZ2mA==",
+		},
+		shouldFail: true,
+	},
 }
 
 func TestDecryptRequest(t *testing.T) {
 	defer func(flag bool) { globalIsSSL = flag }(globalIsSSL)
 	globalIsSSL = true
-	for i, test := range decryptRequestTests {
+	for i, test := range decryptRequestTests[1:] {
 		client := bytes.NewBuffer(nil)
 		req := &http.Request{Header: http.Header{}}
 		for k, v := range test.header {
 			req.Header.Set(k, v)
 		}
-		_, err := DecryptRequest(client, req, test.metadata)
+		_, err := DecryptRequest(client, req, test.bucket, test.object, test.metadata)
 		if err != nil && !test.shouldFail {
 			t.Fatalf("Test %d: Failed to encrypt request: %v", i, err)
+		}
+		if err == nil && test.shouldFail {
+			t.Fatalf("Test %d: should fail but passed", i)
 		}
 		if key, ok := test.metadata[SSECustomerKey]; ok {
 			t.Errorf("Test %d: Client provided key survived in metadata - key: %s", i, key)

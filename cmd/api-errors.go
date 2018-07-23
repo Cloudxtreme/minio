@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,12 +17,14 @@
 package cmd
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"net/http"
 
 	"github.com/minio/minio/pkg/auth"
-	"github.com/minio/minio/pkg/errors"
+	"github.com/minio/minio/pkg/dns"
+	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/hash"
 )
 
@@ -41,8 +43,8 @@ type APIErrorResponse struct {
 	Key        string
 	BucketName string
 	Resource   string
-	RequestID  string `xml:"RequestId"`
-	HostID     string `xml:"HostId"`
+	RequestID  string `xml:"RequestId" json:"RequestId"`
+	HostID     string `xml:"HostId" json:"HostId"`
 }
 
 // APIErrorCode type of error status.
@@ -124,10 +126,12 @@ const (
 	ErrUnsupportedMetadata
 	ErrMaximumExpires
 	ErrSlowDown
+	ErrInvalidPrefixMarker
 	// Add new error codes here.
 
 	// Server-Side-Encryption (with Customer provided key) related API errors.
 	ErrInsecureSSECustomerRequest
+	ErrSSEMultipartEncrypted
 	ErrSSEEncryptedObject
 	ErrInvalidEncryptionParameters
 	ErrInvalidSSECustomerAlgorithm
@@ -135,6 +139,7 @@ const (
 	ErrMissingSSECustomerKey
 	ErrMissingSSECustomerKeyMD5
 	ErrSSECustomerKeyMD5Mismatch
+	ErrInvalidSSECustomerParameters
 
 	// Bucket notification related errors.
 	ErrEventNotification
@@ -157,6 +162,7 @@ const (
 	ErrReadQuorum
 	ErrWriteQuorum
 	ErrStorageFull
+	ErrRequestBodyParse
 	ErrObjectExistsAsDirectory
 	ErrPolicyNesting
 	ErrInvalidObjectName
@@ -165,14 +171,14 @@ const (
 	ErrOperationTimedOut
 	ErrPartsSizeUnequal
 	ErrInvalidRequest
-
 	// Minio storage class error codes
 	ErrInvalidStorageClass
-
+	ErrBackendDown
 	// Add new extended error codes here.
 	// Please open a https://github.com/minio/minio/issues before adding
 	// new error codes here.
 
+	ErrMalformedJSON
 	ErrAdminInvalidAccessKey
 	ErrAdminInvalidSecretKey
 	ErrAdminConfigNoQuorum
@@ -182,6 +188,12 @@ const (
 	ErrInsecureClientRequest
 	ErrObjectTampered
 	ErrHealNotImplemented
+	ErrHealNoSuchProcess
+	ErrHealInvalidClientToken
+	ErrHealMissingBucket
+	ErrHealAlreadyRunning
+	ErrHealOverlappingPaths
+	ErrIncorrectContinuationToken
 )
 
 // error code to APIError structure, these fields carry respective
@@ -524,6 +536,12 @@ var errorCodeResponse = map[APIErrorCode]APIError{
 		Description:    "Please reduce your request",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
+	ErrInvalidPrefixMarker: {
+		Code:           "InvalidPrefixMarker",
+		Description:    "Invalid marker prefix combination",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
 	// FIXME: Actual XML error response also contains the header which missed in list of signed header parameters.
 	ErrUnsignedHeaders: {
 		Code:           "AccessDenied",
@@ -614,12 +632,17 @@ var errorCodeResponse = map[APIErrorCode]APIError{
 	},
 	ErrInsecureSSECustomerRequest: {
 		Code:           "InvalidRequest",
-		Description:    errInsecureSSERequest.Error(),
+		Description:    "Requests specifying Server Side Encryption with Customer provided keys must be made over a secure connection.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrSSEMultipartEncrypted: {
+		Code:           "InvalidRequest",
+		Description:    "The multipart upload initiate requested encryption. Subsequent part requests must include the appropriate encryption parameters.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrSSEEncryptedObject: {
 		Code:           "InvalidRequest",
-		Description:    errEncryptedObject.Error(),
+		Description:    "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidEncryptionParameters: {
@@ -629,27 +652,32 @@ var errorCodeResponse = map[APIErrorCode]APIError{
 	},
 	ErrInvalidSSECustomerAlgorithm: {
 		Code:           "InvalidArgument",
-		Description:    errInvalidSSEAlgorithm.Error(),
+		Description:    "Requests specifying Server Side Encryption with Customer provided keys must provide a valid encryption algorithm.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidSSECustomerKey: {
 		Code:           "InvalidArgument",
-		Description:    errInvalidSSEKey.Error(),
+		Description:    "The secret key was invalid for the specified algorithm.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrMissingSSECustomerKey: {
 		Code:           "InvalidArgument",
-		Description:    errMissingSSEKey.Error(),
+		Description:    "Requests specifying Server Side Encryption with Customer provided keys must provide an appropriate secret key.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrMissingSSECustomerKeyMD5: {
 		Code:           "InvalidArgument",
-		Description:    errMissingSSEKeyMD5.Error(),
+		Description:    "Requests specifying Server Side Encryption with Customer provided keys must provide the client calculated MD5 of the secret key.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrSSECustomerKeyMD5Mismatch: {
 		Code:           "InvalidArgument",
-		Description:    errSSEKeyMD5Mismatch.Error(),
+		Description:    "The calculated MD5 hash of the key did not match the hash that was provided.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidSSECustomerParameters: {
+		Code:           "InvalidArgument",
+		Description:    "The provided encryption parameters did not match the ones used originally.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 
@@ -664,7 +692,12 @@ var errorCodeResponse = map[APIErrorCode]APIError{
 	ErrStorageFull: {
 		Code:           "XMinioStorageFull",
 		Description:    "Storage backend has reached its minimum free disk threshold. Please delete a few objects to proceed.",
-		HTTPStatusCode: http.StatusInternalServerError,
+		HTTPStatusCode: http.StatusInsufficientStorage,
+	},
+	ErrRequestBodyParse: {
+		Code:           "XMinioRequestBodyParse",
+		Description:    "The request body failed to parse.",
+		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrObjectExistsAsDirectory: {
 		Code:           "XMinioObjectExistsAsDirectory",
@@ -700,6 +733,11 @@ var errorCodeResponse = map[APIErrorCode]APIError{
 		Code:           "XMinioServerNotInitialized",
 		Description:    "Server not initialized, please try again.",
 		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrMalformedJSON: {
+		Code:           "XMinioMalformedJSON",
+		Description:    "The JSON you provided was not well-formed or did not validate against our published format.",
+		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrAdminInvalidAccessKey: {
 		Code:           "XMinioAdminInvalidAccessKey",
@@ -757,25 +795,59 @@ var errorCodeResponse = map[APIErrorCode]APIError{
 		Description:    errObjectTampered.Error(),
 		HTTPStatusCode: http.StatusPartialContent,
 	},
-	ErrHealNotImplemented: {
-		Code:           "XMinioHealNotImplemented",
-		Description:    "This server does not implement heal functionality.",
-		HTTPStatusCode: http.StatusBadRequest,
-	},
 	ErrMaximumExpires: {
 		Code:           "AuthorizationQueryParametersError",
 		Description:    "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires must be less than 604800 seconds",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	// Generic Invalid-Request error. Should be used for response errors only for unlikely
-	// corner case errors for which introducing new APIErrorCode is not worth it. errorIf()
+	// corner case errors for which introducing new APIErrorCode is not worth it. LogIf()
 	// should be used to log the error at the source of the error for debugging purposes.
 	ErrInvalidRequest: {
 		Code:           "InvalidRequest",
 		Description:    "Invalid Request",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
-
+	ErrHealNotImplemented: {
+		Code:           "XMinioHealNotImplemented",
+		Description:    "This server does not implement heal functionality.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrHealNoSuchProcess: {
+		Code:           "XMinioHealNoSuchProcess",
+		Description:    "No such heal process is running on the server",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrHealInvalidClientToken: {
+		Code:           "XMinioHealInvalidClientToken",
+		Description:    "Client token mismatch",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrHealMissingBucket: {
+		Code:           "XMinioHealMissingBucket",
+		Description:    "A heal start request with a non-empty object-prefix parameter requires a bucket to be specified.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrHealAlreadyRunning: {
+		Code:           "XMinioHealAlreadyRunning",
+		Description:    "",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrHealOverlappingPaths: {
+		Code:           "XMinioHealOverlappingPaths",
+		Description:    "",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrBackendDown: {
+		Code:           "XMinioBackendDown",
+		Description:    "Object storage backend is unreachable",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrIncorrectContinuationToken: {
+		Code:           "InvalidArgument",
+		Description:    "The continuation token provided is incorrect",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	// Add your error structure here.
 }
 
@@ -787,7 +859,6 @@ func toAPIErrorCode(err error) (apiErr APIErrorCode) {
 		return ErrNone
 	}
 
-	err = errors.Cause(err)
 	// Verify if the underlying error is signature mismatch.
 	switch err {
 	case errSignatureMismatch:
@@ -800,6 +871,29 @@ func toAPIErrorCode(err error) (apiErr APIErrorCode) {
 		apiErr = ErrAdminInvalidAccessKey
 	case auth.ErrInvalidSecretKeyLength:
 		apiErr = ErrAdminInvalidSecretKey
+	// SSE errors
+	case errInsecureSSERequest:
+		apiErr = ErrInsecureSSECustomerRequest
+	case errInvalidSSEAlgorithm:
+		apiErr = ErrInvalidSSECustomerAlgorithm
+	case errInvalidSSEKey:
+		apiErr = ErrInvalidSSECustomerKey
+	case errMissingSSEKey:
+		apiErr = ErrMissingSSECustomerKey
+	case errMissingSSEKeyMD5:
+		apiErr = ErrMissingSSECustomerKeyMD5
+	case errSSEKeyMD5Mismatch:
+		apiErr = ErrSSECustomerKeyMD5Mismatch
+	case errObjectTampered:
+		apiErr = ErrObjectTampered
+	case errEncryptedObject:
+		apiErr = ErrSSEEncryptedObject
+	case errInvalidSSEParameters:
+		apiErr = ErrInvalidSSECustomerParameters
+	case errSSEKeyMismatch:
+		apiErr = ErrAccessDenied // no access without correct key
+	case context.Canceled, context.DeadlineExceeded:
+		apiErr = ErrOperationTimedOut
 	}
 
 	if apiErr != ErrNone {
@@ -807,25 +901,10 @@ func toAPIErrorCode(err error) (apiErr APIErrorCode) {
 		return apiErr
 	}
 
-	switch err { // SSE errors
-	case errInsecureSSERequest:
-		return ErrInsecureSSECustomerRequest
-	case errInvalidSSEAlgorithm:
-		return ErrInvalidSSECustomerAlgorithm
-	case errInvalidSSEKey:
-		return ErrInvalidSSECustomerKey
-	case errMissingSSEKey:
-		return ErrMissingSSECustomerKey
-	case errMissingSSEKeyMD5:
-		return ErrMissingSSECustomerKeyMD5
-	case errSSEKeyMD5Mismatch:
-		return ErrSSECustomerKeyMD5Mismatch
-	case errObjectTampered:
-		return ErrObjectTampered
-	case errEncryptedObject:
-		return ErrSSEEncryptedObject
-	case errSSEKeyMismatch:
-		return ErrAccessDenied // no access without correct key
+	// etcd specific errors, a key is always a bucket for us return
+	// ErrNoSuchBucket in such a case.
+	if err == dns.ErrNoEntriesFound {
+		return ErrNoSuchBucket
 	}
 
 	switch err.(type) {
@@ -855,6 +934,8 @@ func toAPIErrorCode(err error) (apiErr APIErrorCode) {
 		apiErr = ErrBucketAlreadyOwnedByYou
 	case ObjectNotFound:
 		apiErr = ErrNoSuchKey
+	case ObjectAlreadyExists:
+		apiErr = ErrMethodNotAllowed
 	case ObjectNameInvalid:
 		apiErr = ErrInvalidObjectName
 	case InvalidUploadID:
@@ -885,8 +966,6 @@ func toAPIErrorCode(err error) (apiErr APIErrorCode) {
 		apiErr = ErrEntityTooSmall
 	case NotImplemented:
 		apiErr = ErrNotImplemented
-	case PolicyNotFound:
-		apiErr = ErrNoSuchBucketPolicy
 	case PartTooBig:
 		apiErr = ErrEntityTooLarge
 	case UnsupportedMetadata:
@@ -895,6 +974,30 @@ func toAPIErrorCode(err error) (apiErr APIErrorCode) {
 		apiErr = ErrPartsSizeUnequal
 	case BucketPolicyNotFound:
 		apiErr = ErrNoSuchBucketPolicy
+	case *event.ErrInvalidEventName:
+		apiErr = ErrEventNotification
+	case *event.ErrInvalidARN:
+		apiErr = ErrARNNotification
+	case *event.ErrARNNotFound:
+		apiErr = ErrARNNotification
+	case *event.ErrUnknownRegion:
+		apiErr = ErrRegionNotification
+	case *event.ErrInvalidFilterName:
+		apiErr = ErrFilterNameInvalid
+	case *event.ErrFilterNamePrefix:
+		apiErr = ErrFilterNamePrefix
+	case *event.ErrFilterNameSuffix:
+		apiErr = ErrFilterNameSuffix
+	case *event.ErrInvalidFilterValue:
+		apiErr = ErrFilterValueInvalid
+	case *event.ErrDuplicateEventName:
+		apiErr = ErrOverlappingConfigs
+	case *event.ErrDuplicateQueueConfiguration:
+		apiErr = ErrOverlappingFilterNotification
+	case *event.ErrUnsupportedConfiguration:
+		apiErr = ErrUnsupportedNotification
+	case BackendDown:
+		apiErr = ErrBackendDown
 	default:
 		apiErr = ErrInternalError
 	}
@@ -909,12 +1012,12 @@ func getAPIError(code APIErrorCode) APIError {
 
 // getErrorResponse gets in standard error and resource value and
 // provides a encodable populated response values
-func getAPIErrorResponse(err APIError, resource string) APIErrorResponse {
+func getAPIErrorResponse(err APIError, resource, requestid string) APIErrorResponse {
 	return APIErrorResponse{
 		Code:      err.Code,
 		Message:   err.Description,
 		Resource:  resource,
-		RequestID: "3L137",
+		RequestID: requestid,
 		HostID:    "3L137",
 	}
 }

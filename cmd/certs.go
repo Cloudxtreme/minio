@@ -17,13 +17,16 @@
 package cmd
 
 import (
+	"bytes"
+	"crypto"
+	"crypto/ecdsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
 	"io/ioutil"
 	"os"
-	"path/filepath"
+
+	"github.com/minio/minio/pkg/certs"
 )
 
 // TLSPrivateKeyPassword is the environment variable which contains the password used
@@ -38,24 +41,27 @@ func parsePublicCertFile(certFile string) (x509Certs []*x509.Certificate, err er
 		return nil, err
 	}
 
+	// Trimming leading and tailing white spaces.
+	data = bytes.TrimSpace(data)
+
 	// Parse all certs in the chain.
 	current := data
 	for len(current) > 0 {
 		var pemBlock *pem.Block
 		if pemBlock, current = pem.Decode(current); pemBlock == nil {
-			return nil, fmt.Errorf("Could not read PEM block from file %s", certFile)
+			return nil, uiErrSSLUnexpectedData(nil).Msg("Could not read PEM block from file %s", certFile)
 		}
 
 		var x509Cert *x509.Certificate
 		if x509Cert, err = x509.ParseCertificate(pemBlock.Bytes); err != nil {
-			return nil, err
+			return nil, uiErrSSLUnexpectedData(err)
 		}
 
 		x509Certs = append(x509Certs, x509Cert)
 	}
 
 	if len(x509Certs) == 0 {
-		return nil, fmt.Errorf("Empty public certificate file %s", certFile)
+		return nil, uiErrSSLUnexpectedData(nil).Msg("Empty public certificate file %s", certFile)
 	}
 
 	return x509Certs, nil
@@ -64,22 +70,27 @@ func parsePublicCertFile(certFile string) (x509Certs []*x509.Certificate, err er
 func getRootCAs(certsCAsDir string) (*x509.CertPool, error) {
 	// Get all CA file names.
 	var caFiles []string
-	fis, err := ioutil.ReadDir(certsCAsDir)
+	fis, err := readDir(certsCAsDir)
 	if err != nil {
 		return nil, err
 	}
 	for _, fi := range fis {
-		caFiles = append(caFiles, filepath.Join(certsCAsDir, fi.Name()))
+		// Skip all directories.
+		if hasSuffix(fi, slashSeparator) {
+			continue
+		}
+		// We are only interested in regular files here.
+		caFiles = append(caFiles, pathJoin(certsCAsDir, fi))
 	}
-
 	if len(caFiles) == 0 {
 		return nil, nil
 	}
 
-	rootCAs, err := x509.SystemCertPool()
-	if err != nil {
-		// In some systems like Windows, system cert pool is not supported.
-		// Hence we create a new cert pool.
+	rootCAs, _ := x509.SystemCertPool()
+	if rootCAs == nil {
+		// In some systems (like Windows) system cert pool is
+		// not supported or no certificates are present on the
+		// system - so we create a new cert pool.
 		rootCAs = x509.NewCertPool()
 	}
 
@@ -102,31 +113,44 @@ func getRootCAs(certsCAsDir string) (*x509.CertPool, error) {
 func loadX509KeyPair(certFile, keyFile string) (tls.Certificate, error) {
 	certPEMBlock, err := ioutil.ReadFile(certFile)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("TLS: failed to read cert file: %v", err)
+		return tls.Certificate{}, uiErrSSLUnexpectedError(err)
 	}
 	keyPEMBlock, err := ioutil.ReadFile(keyFile)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("TLS: failed to read private key: %v", err)
+		return tls.Certificate{}, uiErrSSLUnexpectedError(err)
 	}
 	key, rest := pem.Decode(keyPEMBlock)
 	if len(rest) > 0 {
-		return tls.Certificate{}, fmt.Errorf("TLS: private key contains additional data")
+		return tls.Certificate{}, uiErrSSLUnexpectedData(nil).Msg("The private key contains additional data")
 	}
 	if x509.IsEncryptedPEMBlock(key) {
 		password, ok := os.LookupEnv(TLSPrivateKeyPassword)
 		if !ok {
-			return tls.Certificate{}, fmt.Errorf("TLS: private key is encrypted but no password is present - set env var: %s", TLSPrivateKeyPassword)
+			return tls.Certificate{}, uiErrSSLNoPassword(nil)
 		}
 		decryptedKey, decErr := x509.DecryptPEMBlock(key, []byte(password))
 		if decErr != nil {
-			return tls.Certificate{}, fmt.Errorf("TLS: failed to decrypt private key: %v", decErr)
+			return tls.Certificate{}, uiErrSSLWrongPassword(decErr)
 		}
 		keyPEMBlock = pem.EncodeToMemory(&pem.Block{Type: key.Type, Bytes: decryptedKey})
 	}
-	return tls.X509KeyPair(certPEMBlock, keyPEMBlock)
+	cert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
+	if err != nil {
+		return tls.Certificate{}, uiErrSSLUnexpectedData(nil).Msg(err.Error())
+	}
+	// Ensure that the private key is not a P-384 or P-521 EC key.
+	// The Go TLS stack does not provide constant-time implementations of P-384 and P-521.
+	if priv, ok := cert.PrivateKey.(crypto.Signer); ok {
+		if pub, ok := priv.Public().(*ecdsa.PublicKey); ok {
+			if name := pub.Params().Name; name == "P-384" || name == "P-521" { // unfortunately there is no cleaner way to check
+				return tls.Certificate{}, uiErrSSLUnexpectedData(nil).Msg("tls: the ECDSA curve '%s' is not supported", name)
+			}
+		}
+	}
+	return cert, nil
 }
 
-func getSSLConfig() (x509Certs []*x509.Certificate, rootCAs *x509.CertPool, tlsCert *tls.Certificate, secureConn bool, err error) {
+func getSSLConfig() (x509Certs []*x509.Certificate, rootCAs *x509.CertPool, c *certs.Certs, secureConn bool, err error) {
 	if !(isFile(getPublicCertFile()) && isFile(getPrivateKeyFile())) {
 		return nil, nil, nil, false, nil
 	}
@@ -135,17 +159,15 @@ func getSSLConfig() (x509Certs []*x509.Certificate, rootCAs *x509.CertPool, tlsC
 		return nil, nil, nil, false, err
 	}
 
-	var cert tls.Certificate
-	if cert, err = loadX509KeyPair(getPublicCertFile(), getPrivateKeyFile()); err != nil {
+	c, err = certs.New(getPublicCertFile(), getPrivateKeyFile(), loadX509KeyPair)
+	if err != nil {
 		return nil, nil, nil, false, err
 	}
-
-	tlsCert = &cert
 
 	if rootCAs, err = getRootCAs(getCADir()); err != nil {
 		return nil, nil, nil, false, err
 	}
 
 	secureConn = true
-	return x509Certs, rootCAs, tlsCert, secureConn, nil
+	return x509Certs, rootCAs, c, secureConn, nil
 }

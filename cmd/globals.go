@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,16 +17,20 @@
 package cmd
 
 import (
-	"crypto/tls"
 	"crypto/x509"
 	"os"
 	"runtime"
 	"time"
 
+	"github.com/minio/minio-go/pkg/set"
+
+	etcd "github.com/coreos/etcd/clientv3"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/fatih/color"
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/pkg/auth"
-	miniohttp "github.com/minio/minio/pkg/http"
+	"github.com/minio/minio/pkg/certs"
+	"github.com/minio/minio/pkg/dns"
 )
 
 // minio configuration related constants.
@@ -68,12 +72,24 @@ const (
 	// date and server date during signature verification.
 	globalMaxSkewTime = 15 * time.Minute // 15 minutes skew allowed.
 
-	// Default Read/Write timeouts for each connection.
-	globalConnReadTimeout  = 15 * time.Minute // Timeout after 15 minutes of no data sent by the client.
-	globalConnWriteTimeout = 15 * time.Minute // Timeout after 15 minutes if no data received by the client.
+	// Expiry duration after which the multipart uploads are deemed stale.
+	globalMultipartExpiry = time.Hour * 24 * 14 // 2 weeks.
+	// Cleanup interval when the stale multipart cleanup is initiated.
+	globalMultipartCleanupInterval = time.Hour * 24 // 24 hrs.
+	// Refresh interval to update in-memory bucket policy cache.
+	globalRefreshBucketPolicyInterval = 5 * time.Minute
+
+	// Limit of location constraint XML for unauthenticted PUT bucket operations.
+	maxLocationConstraintSize = 3 * humanize.MiByte
 )
 
 var (
+	// Indicates the total number of erasure coded sets configured.
+	globalXLSetCount int
+
+	// Indicates set drive count.
+	globalXLSetDriveCount int
+
 	// Indicates if the running minio server is distributed setup.
 	globalIsDistXL = false
 
@@ -108,8 +124,8 @@ var (
 	// Holds the host that was passed using --address
 	globalMinioHost = ""
 
-	// Peer communication struct
-	globalS3Peers = s3Peers{}
+	globalNotificationSys *NotificationSys
+	globalPolicySys       *PolicySys
 
 	// CA root certificates, a nil value means system certs pool will be used
 	globalRootCAs *x509.CertPool
@@ -117,9 +133,9 @@ var (
 	// IsSSL indicates if the server is configured with SSL.
 	globalIsSSL bool
 
-	globalTLSCertificate *tls.Certificate
+	globalTLSCerts *certs.Certs
 
-	globalHTTPServer        *miniohttp.Server
+	globalHTTPServer        *xhttp.Server
 	globalHTTPServerErrorCh = make(chan error)
 	globalOSSignalCh        = make(chan os.Signal, 1)
 
@@ -143,20 +159,17 @@ var (
 	// Time when object layer was initialized on start up.
 	globalBootTime time.Time
 
-	globalActiveCred         auth.Credentials
-	globalPublicCerts        []*x509.Certificate
-	globalXLObjCacheDisabled bool
+	globalActiveCred  auth.Credentials
+	globalPublicCerts []*x509.Certificate
 
 	globalIsEnvDomainName bool
-	globalDomainName      string // Root domain for virtual host style requests
+	globalDomainName      string        // Root domain for virtual host style requests
+	globalDomainIPs       set.StringSet // Root domain IP address(s) for a distributed Minio deployment
 
 	globalListingTimeout   = newDynamicTimeout( /*30*/ 600*time.Second /*5*/, 600*time.Second) // timeout for listing related ops
 	globalObjectTimeout    = newDynamicTimeout( /*1*/ 10*time.Minute /*10*/, 600*time.Second)  // timeout for Object API related ops
 	globalOperationTimeout = newDynamicTimeout(10*time.Minute /*30*/, 600*time.Second)         // default timeout for general ops
 	globalHealingTimeout   = newDynamicTimeout(30*time.Minute /*1*/, 30*time.Minute)           // timeout for healing related ops
-
-	// Keep connection active for clients actively using ListenBucketNotification.
-	globalSNSConnAlive = 5 * time.Second // Send a whitespace every 5 seconds.
 
 	// Storage classes
 	// Set to indicate if storage class is set up
@@ -166,14 +179,52 @@ var (
 	// Set to store standard storage class
 	globalStandardStorageClass storageClass
 
+	globalIsEnvWORM bool
+	// Is worm enabled
+	globalWORMEnabled bool
+
+	// Is Disk Caching set up
+	globalIsDiskCacheEnabled bool
+
+	// Disk cache drives
+	globalCacheDrives []string
+
+	// Disk cache excludes
+	globalCacheExcludes []string
+
+	// Disk cache expiry
+	globalCacheExpiry = 90
+	// Max allowed disk cache percentage
+	globalCacheMaxUse = 80
+
+	// RPC V1 - Initial version
+	// RPC V2 - format.json XL version changed to 2
+	// RPC V3 - format.json XL version changed to 3
+	// Current RPC version
+	globalRPCAPIVersion = RPCVersion{3, 0, 0}
+
+	// Allocated etcd endpoint for config and bucket DNS.
+	globalEtcdClient *etcd.Client
+
+	// Allocated DNS config wrapper over etcd client.
+	globalDNSConfig dns.Config
+
+	// Default usage check interval value.
+	globalDefaultUsageCheckInterval = 12 * time.Hour // 12 hours
+	// Usage check interval value.
+	globalUsageCheckInterval = globalDefaultUsageCheckInterval
+
 	// Add new variable global values here.
 )
 
 // global colors.
 var (
-	colorBold   = color.New(color.Bold).SprintFunc()
-	colorBlue   = color.New(color.FgBlue).SprintfFunc()
-	colorYellow = color.New(color.FgYellow).SprintfFunc()
+	colorBold     = color.New(color.Bold).SprintFunc()
+	colorRed      = color.New(color.FgRed).SprintfFunc()
+	colorBlue     = color.New(color.FgBlue).SprintfFunc()
+	colorYellow   = color.New(color.FgYellow).SprintfFunc()
+	colorBgYellow = color.New(color.BgYellow).SprintfFunc()
+	colorBlack    = color.New(color.FgBlack).SprintfFunc()
 )
 
 // Returns minio global information, as a key value map.
@@ -184,6 +235,7 @@ func getGlobalInfo() (globalInfo map[string]interface{}) {
 		"isDistXL":         globalIsDistXL,
 		"isXL":             globalIsXL,
 		"isBrowserEnabled": globalIsBrowserEnabled,
+		"isWorm":           globalWORMEnabled,
 		"isEnvBrowser":     globalIsEnvBrowser,
 		"isEnvCreds":       globalIsEnvCreds,
 		"isEnvRegion":      globalIsEnvRegion,

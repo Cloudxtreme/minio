@@ -16,24 +16,38 @@
 
 package cmd
 
-import router "github.com/gorilla/mux"
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/gorilla/mux"
+	"github.com/minio/minio/cmd/logger"
+)
 
 // objectAPIHandler implements and provides http handlers for S3 API.
 type objectAPIHandlers struct {
 	ObjectAPI func() ObjectLayer
+	CacheAPI  func() CacheObjectLayer
 }
 
 // registerAPIRouter - registers S3 compatible APIs.
-func registerAPIRouter(mux *router.Router) {
+func registerAPIRouter(router *mux.Router) {
+	var err error
+	var cacheConfig = globalServerConfig.GetCacheConfig()
+	if len(cacheConfig.Drives) > 0 {
+		// initialize the new disk cache objects.
+		globalCacheObjectAPI, err = newServerCacheObjects(cacheConfig)
+		logger.FatalIf(err, "Unable to initialize disk caching")
+	}
+
 	// Initialize API.
 	api := objectAPIHandlers{
 		ObjectAPI: newObjectLayerFn,
+		CacheAPI:  newCacheObjectsFn,
 	}
 
 	// API Router
-	apiRouter := mux.NewRoute().PathPrefix("/").Subrouter()
-	var routers []*router.Router
+	apiRouter := router.PathPrefix("/").Subrouter()
+	var routers []*mux.Router
 	if globalDomainName != "" {
 		routers = append(routers, apiRouter.Host("{bucket:.+}."+globalDomainName).Subrouter())
 	}
@@ -55,6 +69,8 @@ func registerAPIRouter(mux *router.Router) {
 		bucket.Methods("POST").Path("/{object:.+}").HandlerFunc(httpTraceAll(api.NewMultipartUploadHandler)).Queries("uploads", "")
 		// AbortMultipartUpload
 		bucket.Methods("DELETE").Path("/{object:.+}").HandlerFunc(httpTraceAll(api.AbortMultipartUploadHandler)).Queries("uploadId", "{uploadId:.*}")
+		// GetObjectACL - this is a dummy call.
+		bucket.Methods("GET").Path("/{object:.+}").HandlerFunc(httpTraceHdrs(api.GetObjectACLHandler)).Queries("acl", "")
 		// GetObject
 		bucket.Methods("GET").Path("/{object:.+}").HandlerFunc(httpTraceHdrs(api.GetObjectHandler))
 		// CopyObject
@@ -69,6 +85,10 @@ func registerAPIRouter(mux *router.Router) {
 		bucket.Methods("GET").HandlerFunc(httpTraceAll(api.GetBucketLocationHandler)).Queries("location", "")
 		// GetBucketPolicy
 		bucket.Methods("GET").HandlerFunc(httpTraceAll(api.GetBucketPolicyHandler)).Queries("policy", "")
+
+		// GetBucketACL -- this is a dummy call.
+		bucket.Methods("GET").HandlerFunc(httpTraceAll(api.GetBucketACLHandler)).Queries("acl", "")
+
 		// GetBucketNotification
 		bucket.Methods("GET").HandlerFunc(httpTraceAll(api.GetBucketNotificationHandler)).Queries("notification", "")
 		// ListenBucketNotification
@@ -88,7 +108,7 @@ func registerAPIRouter(mux *router.Router) {
 		// HeadBucket
 		bucket.Methods("HEAD").HandlerFunc(httpTraceAll(api.HeadBucketHandler))
 		// PostPolicy
-		bucket.Methods("POST").HeadersRegexp("Content-Type", "multipart/form-data*").HandlerFunc(httpTraceAll(api.PostPolicyBucketHandler))
+		bucket.Methods("POST").HeadersRegexp("Content-Type", "multipart/form-data*").HandlerFunc(httpTraceHdrs(api.PostPolicyBucketHandler))
 		// DeleteMultipleObjects
 		bucket.Methods("POST").HandlerFunc(httpTraceAll(api.DeleteMultipleObjectsHandler)).Queries("delete", "")
 		// DeleteBucketPolicy

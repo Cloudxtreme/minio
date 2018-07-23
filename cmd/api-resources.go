@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,7 +36,17 @@ func getListObjectsV1Args(values url.Values) (prefix, marker, delimiter string, 
 }
 
 // Parse bucket url queries for ListObjects V2.
-func getListObjectsV2Args(values url.Values) (prefix, token, startAfter, delimiter string, fetchOwner bool, maxkeys int, encodingType string) {
+func getListObjectsV2Args(values url.Values) (prefix, token, startAfter, delimiter string, fetchOwner bool, maxkeys int, encodingType string, errCode APIErrorCode) {
+	errCode = ErrNone
+
+	// The continuation-token cannot be empty.
+	if val, ok := values["continuation-token"]; ok {
+		if len(val[0]) == 0 {
+			errCode = ErrIncorrectContinuationToken
+			return
+		}
+	}
+
 	prefix = values.Get("prefix")
 	token = values.Get("continuation-token")
 	startAfter = values.Get("start-after")
@@ -77,22 +87,4 @@ func getObjectResources(values url.Values) (uploadID string, partNumberMarker, m
 	}
 	encodingType = values.Get("encoding-type")
 	return
-}
-
-// Parse listen bucket notification resources.
-func getListenBucketNotificationResources(values url.Values) (prefix []string, suffix []string, events []string) {
-	prefix = values["prefix"]
-	suffix = values["suffix"]
-	events = values["events"]
-	return prefix, suffix, events
-}
-
-// Validates filter values
-func validateFilterValues(values []string) (err APIErrorCode) {
-	for _, value := range values {
-		if !IsValidObjectPrefix(value) {
-			return ErrFilterValueInvalid
-		}
-	}
-	return ErrNone
 }

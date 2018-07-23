@@ -16,7 +16,9 @@
 
 package cmd
 
-import "time"
+import (
+	"time"
+)
 
 // SystemLockState - Structure to fill the lock state of entire object storage.
 // That is the total locks held, total calls blocked on locks and state of all the locks for the entire system.
@@ -62,51 +64,4 @@ type OpsLockState struct {
 	LockType    lockType   `json:"type"`   // Lock type (RLock, WLock)
 	Status      statusType `json:"status"` // Status can be Running/Ready/Blocked.
 	Since       time.Time  `json:"since"`  // Time when the lock was initially held.
-}
-
-// listLocksInfo - Fetches locks held on bucket, matching prefix held for longer than duration.
-func listLocksInfo(bucket, prefix string, duration time.Duration) []VolumeLockInfo {
-	globalNSMutex.lockMapMutex.Lock()
-	defer globalNSMutex.lockMapMutex.Unlock()
-
-	// Fetch current time once instead of fetching system time for every lock.
-	timeNow := UTCNow()
-	volumeLocks := []VolumeLockInfo{}
-
-	for param, debugLock := range globalNSMutex.debugLockMap {
-		if param.volume != bucket {
-			continue
-		}
-		// N B empty prefix matches all param.path.
-		if !hasPrefix(param.path, prefix) {
-			continue
-		}
-
-		volLockInfo := VolumeLockInfo{
-			Bucket:                param.volume,
-			Object:                param.path,
-			LocksOnObject:         debugLock.counters.total,
-			TotalBlockedLocks:     debugLock.counters.blocked,
-			LocksAcquiredOnObject: debugLock.counters.granted,
-		}
-		// Filter locks that are held on bucket, prefix.
-		for opsID, lockInfo := range debugLock.lockInfo {
-			// filter locks that were held for longer than duration.
-			elapsed := timeNow.Sub(lockInfo.since)
-			if elapsed < duration {
-				continue
-			}
-			// Add locks that are held for longer than duration.
-			volLockInfo.LockDetailsOnObject = append(volLockInfo.LockDetailsOnObject,
-				OpsLockState{
-					OperationID: opsID,
-					LockSource:  lockInfo.lockSource,
-					LockType:    lockInfo.lType,
-					Status:      lockInfo.status,
-					Since:       lockInfo.since,
-				})
-			volumeLocks = append(volumeLocks, volLockInfo)
-		}
-	}
-	return volumeLocks
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,234 +17,111 @@
 package cmd
 
 import (
-	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"os"
-	"path/filepath"
+	"context"
+	"path"
 	"time"
 
-	router "github.com/gorilla/mux"
-	"github.com/minio/minio/pkg/errors"
+	"github.com/gorilla/mux"
+	"github.com/minio/minio/cmd/logger"
+	xrpc "github.com/minio/minio/cmd/rpc"
 )
 
-const adminPath = "/admin"
+const adminServiceName = "Admin"
+const adminServiceSubPath = "/admin"
 
-var errUnsupportedBackend = fmt.Errorf("not supported for non erasure-code backend")
+var adminServicePath = path.Join(minioReservedBucketPath, adminServiceSubPath)
 
-// adminCmd - exports RPC methods for service status, stop and
-// restart commands.
-type adminCmd struct {
-	AuthRPCServer
+// adminRPCReceiver - Admin RPC receiver for admin RPC server.
+type adminRPCReceiver struct {
+	local *localAdminClient
+}
+
+// SignalServiceArgs - provides the signal argument to SignalService RPC
+type SignalServiceArgs struct {
+	AuthArgs
+	Sig serviceSignal
+}
+
+// SignalService - Send a restart or stop signal to the service
+func (receiver *adminRPCReceiver) SignalService(args *SignalServiceArgs, reply *VoidReply) error {
+	return receiver.local.SignalService(args.Sig)
 }
 
 // ListLocksQuery - wraps ListLocks API's query values to send over RPC.
 type ListLocksQuery struct {
-	AuthRPCArgs
-	bucket   string
-	prefix   string
-	duration time.Duration
-}
-
-// ListLocksReply - wraps ListLocks response over RPC.
-type ListLocksReply struct {
-	AuthRPCReply
-	volLocks []VolumeLockInfo
-}
-
-// ServerInfoDataReply - wraps the server info response over RPC.
-type ServerInfoDataReply struct {
-	AuthRPCReply
-	ServerInfoData ServerInfoData
-}
-
-// ConfigReply - wraps the server config response over RPC.
-type ConfigReply struct {
-	AuthRPCReply
-	Config []byte // json-marshalled bytes of serverConfigV13
-}
-
-// Restart - Restart this instance of minio server.
-func (s *adminCmd) Restart(args *AuthRPCArgs, reply *AuthRPCReply) error {
-	if err := args.IsAuthenticated(); err != nil {
-		return err
-	}
-
-	globalServiceSignalCh <- serviceRestart
-	return nil
+	AuthArgs
+	Bucket   string
+	Prefix   string
+	Duration time.Duration
 }
 
 // ListLocks - lists locks held by requests handled by this server instance.
-func (s *adminCmd) ListLocks(query *ListLocksQuery, reply *ListLocksReply) error {
-	if err := query.IsAuthenticated(); err != nil {
-		return err
-	}
-	volLocks := listLocksInfo(query.bucket, query.prefix, query.duration)
-	*reply = ListLocksReply{volLocks: volLocks}
-	return nil
-}
-
-// ReInitDisk - reinitialize storage disks and object layer to use the
-// new format.
-func (s *adminCmd) ReInitDisks(args *AuthRPCArgs, reply *AuthRPCReply) error {
-	if err := args.IsAuthenticated(); err != nil {
-		return err
-	}
-
-	if !globalIsXL {
-		return errUnsupportedBackend
-	}
-
-	// Get the current object layer instance.
-	objLayer := newObjectLayerFn()
-
-	// Initialize new disks to include the newly formatted disks.
-	bootstrapDisks, err := initStorageDisks(globalEndpoints)
-	if err != nil {
-		return err
-	}
-
-	// Wrap into retrying disks
-	retryingDisks := initRetryableStorageDisks(bootstrapDisks,
-		time.Millisecond, time.Millisecond*5, globalStorageHealthCheckInterval, globalStorageRetryThreshold)
-
-	// Initialize new object layer with newly formatted disks.
-	newObjectAPI, err := newXLObjects(retryingDisks)
-	if err != nil {
-		return err
-	}
-
-	// Replace object layer with newly formatted storage.
-	globalObjLayerMutex.Lock()
-	globalObjectAPI = newObjectAPI
-	globalObjLayerMutex.Unlock()
-
-	// Shutdown storage belonging to old object layer instance.
-	objLayer.Shutdown()
-
-	return nil
+func (receiver *adminRPCReceiver) ListLocks(args *ListLocksQuery, reply *[]VolumeLockInfo) (err error) {
+	*reply, err = receiver.local.ListLocks(args.Bucket, args.Prefix, args.Duration)
+	return err
 }
 
 // ServerInfo - returns the server info when object layer was initialized on this server.
-func (s *adminCmd) ServerInfoData(args *AuthRPCArgs, reply *ServerInfoDataReply) error {
-	if err := args.IsAuthenticated(); err != nil {
-		return err
-	}
-
-	if globalBootTime.IsZero() {
-		return errServerNotInitialized
-	}
-
-	// Build storage info
-	objLayer := newObjectLayerFn()
-	if objLayer == nil {
-		return errServerNotInitialized
-	}
-	storageInfo := objLayer.StorageInfo()
-
-	var arns []string
-	for queueArn := range globalEventNotifier.GetAllExternalTargets() {
-		arns = append(arns, queueArn)
-	}
-
-	reply.ServerInfoData = ServerInfoData{
-		Properties: ServerProperties{
-			Uptime:   UTCNow().Sub(globalBootTime),
-			Version:  Version,
-			CommitID: CommitID,
-			Region:   globalServerConfig.GetRegion(),
-			SQSARN:   arns,
-		},
-		StorageInfo: storageInfo,
-		ConnStats:   globalConnStats.toServerConnStats(),
-		HTTPStats:   globalHTTPStats.toServerHTTPStats(),
-	}
-
-	return nil
+func (receiver *adminRPCReceiver) ServerInfo(args *AuthArgs, reply *ServerInfoData) (err error) {
+	*reply, err = receiver.local.ServerInfo()
+	return err
 }
 
 // GetConfig - returns the config.json of this server.
-func (s *adminCmd) GetConfig(args *AuthRPCArgs, reply *ConfigReply) error {
-	if err := args.IsAuthenticated(); err != nil {
-		return err
-	}
+func (receiver *adminRPCReceiver) GetConfig(args *AuthArgs, reply *[]byte) (err error) {
+	*reply, err = receiver.local.GetConfig()
+	return err
+}
 
-	if globalServerConfig == nil {
-		return fmt.Errorf("config not present")
-	}
+// ReInitFormatArgs - provides dry-run information to re-initialize format.json
+type ReInitFormatArgs struct {
+	AuthArgs
+	DryRun bool
+}
 
-	jsonBytes, err := json.Marshal(globalServerConfig)
-	if err != nil {
-		return err
-	}
-
-	reply.Config = jsonBytes
-	return nil
+// ReInitFormat - re-init 'format.json'
+func (receiver *adminRPCReceiver) ReInitFormat(args *ReInitFormatArgs, reply *VoidReply) error {
+	return receiver.local.ReInitFormat(args.DryRun)
 }
 
 // WriteConfigArgs - wraps the bytes to be written and temporary file name.
 type WriteConfigArgs struct {
-	AuthRPCArgs
+	AuthArgs
 	TmpFileName string
 	Buf         []byte
 }
 
-// WriteConfigReply - wraps the result of a writing config into a temporary file.
-// the remote node.
-type WriteConfigReply struct {
-	AuthRPCReply
-}
-
-func writeTmpConfigCommon(tmpFileName string, configBytes []byte) error {
-	tmpConfigFile := filepath.Join(getConfigDir(), tmpFileName)
-	err := ioutil.WriteFile(tmpConfigFile, configBytes, 0666)
-	errorIf(err, fmt.Sprintf("Failed to write to temporary config file %s", tmpConfigFile))
-	return err
-}
-
 // WriteTmpConfig - writes the supplied config contents onto the
 // supplied temporary file.
-func (s *adminCmd) WriteTmpConfig(wArgs *WriteConfigArgs, wReply *WriteConfigReply) error {
-	if err := wArgs.IsAuthenticated(); err != nil {
-		return err
-	}
-
-	return writeTmpConfigCommon(wArgs.TmpFileName, wArgs.Buf)
+func (receiver *adminRPCReceiver) WriteTmpConfig(args *WriteConfigArgs, reply *VoidReply) error {
+	return receiver.local.WriteTmpConfig(args.TmpFileName, args.Buf)
 }
 
 // CommitConfigArgs - wraps the config file name that needs to be
 // committed into config.json on this node.
 type CommitConfigArgs struct {
-	AuthRPCArgs
+	AuthArgs
 	FileName string
 }
 
-// CommitConfigReply - represents response to commit of config file on
-// this node.
-type CommitConfigReply struct {
-	AuthRPCReply
-}
-
 // CommitConfig - Renames the temporary file into config.json on this node.
-func (s *adminCmd) CommitConfig(cArgs *CommitConfigArgs, cReply *CommitConfigReply) error {
-	configFile := getConfigFile()
-	tmpConfigFile := filepath.Join(getConfigDir(), cArgs.FileName)
-
-	err := os.Rename(tmpConfigFile, configFile)
-	errorIf(err, fmt.Sprintf("Failed to rename %s to %s", tmpConfigFile, configFile))
-	return err
+func (receiver *adminRPCReceiver) CommitConfig(args *CommitConfigArgs, reply *VoidReply) error {
+	return receiver.local.CommitConfig(args.FileName)
 }
 
-// registerAdminRPCRouter - registers RPC methods for service status,
-// stop and restart commands.
-func registerAdminRPCRouter(mux *router.Router) error {
-	adminRPCHandler := &adminCmd{}
-	adminRPCServer := newRPCServer()
-	err := adminRPCServer.RegisterName("Admin", adminRPCHandler)
-	if err != nil {
-		return errors.Trace(err)
+// NewAdminRPCServer - returns new admin RPC server.
+func NewAdminRPCServer() (*xrpc.Server, error) {
+	rpcServer := xrpc.NewServer()
+	if err := rpcServer.RegisterName(adminServiceName, &adminRPCReceiver{&localAdminClient{}}); err != nil {
+		return nil, err
 	}
-	adminRouter := mux.NewRoute().PathPrefix(minioReservedBucketPath).Subrouter()
-	adminRouter.Path(adminPath).Handler(adminRPCServer)
-	return nil
+	return rpcServer, nil
+}
+
+// registerAdminRPCRouter - creates and registers Admin RPC server and its router.
+func registerAdminRPCRouter(router *mux.Router) {
+	rpcServer, err := NewAdminRPCServer()
+	logger.FatalIf(err, "Unable to initialize Lock RPC Server", context.Background())
+	subrouter := router.PathPrefix(minioReservedBucketPath).Subrouter()
+	subrouter.Path(adminServiceSubPath).Handler(rpcServer)
 }

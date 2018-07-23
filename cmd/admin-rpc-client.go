@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2014, 2015, 2016, 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2014, 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,218 +17,148 @@
 package cmd
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
-	"path"
-	"path/filepath"
-	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/minio/minio-go/pkg/set"
-	"github.com/minio/minio/pkg/errors"
+	"github.com/minio/minio/cmd/logger"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
-const (
-	// Admin service names
-	serviceRestartRPC = "Admin.Restart"
-	listLocksRPC      = "Admin.ListLocks"
-	reInitDisksRPC    = "Admin.ReInitDisks"
-	serverInfoDataRPC = "Admin.ServerInfoData"
-	getConfigRPC      = "Admin.GetConfig"
-	writeTmpConfigRPC = "Admin.WriteTmpConfig"
-	commitConfigRPC   = "Admin.CommitConfig"
-)
+var errUnsupportedSignal = fmt.Errorf("unsupported signal: only restart and stop signals are supported")
 
-// localAdminClient - represents admin operation to be executed locally.
-type localAdminClient struct {
+// AdminRPCClient - admin RPC client talks to admin RPC server.
+type AdminRPCClient struct {
+	*RPCClient
 }
 
-// remoteAdminClient - represents admin operation to be executed
-// remotely, via RPC.
-type remoteAdminClient struct {
-	*AuthRPCClient
+// SignalService - calls SignalService RPC.
+func (rpcClient *AdminRPCClient) SignalService(signal serviceSignal) (err error) {
+	args := SignalServiceArgs{Sig: signal}
+	reply := VoidReply{}
+
+	return rpcClient.Call(adminServiceName+".SignalService", &args, &reply)
+}
+
+// ReInitFormat - re-initialize disk format, remotely.
+func (rpcClient *AdminRPCClient) ReInitFormat(dryRun bool) error {
+	args := ReInitFormatArgs{DryRun: dryRun}
+	reply := VoidReply{}
+
+	return rpcClient.Call(adminServiceName+".ReInitFormat", &args, &reply)
+}
+
+// ListLocks - Sends list locks command to remote server via RPC.
+func (rpcClient *AdminRPCClient) ListLocks(bucket, prefix string, duration time.Duration) ([]VolumeLockInfo, error) {
+	args := ListLocksQuery{
+		Bucket:   bucket,
+		Prefix:   prefix,
+		Duration: duration,
+	}
+	var reply []VolumeLockInfo
+
+	err := rpcClient.Call(adminServiceName+".ListLocks", &args, &reply)
+	return reply, err
+}
+
+// ServerInfo - returns the server info of the server to which the RPC call is made.
+func (rpcClient *AdminRPCClient) ServerInfo() (sid ServerInfoData, err error) {
+	err = rpcClient.Call(adminServiceName+".ServerInfo", &AuthArgs{}, &sid)
+	return sid, err
+}
+
+// GetConfig - returns config.json of the remote server.
+func (rpcClient *AdminRPCClient) GetConfig() ([]byte, error) {
+	args := AuthArgs{}
+	var reply []byte
+
+	err := rpcClient.Call(adminServiceName+".GetConfig", &args, &reply)
+	return reply, err
+}
+
+// WriteTmpConfig - writes config file content to a temporary file on a remote node.
+func (rpcClient *AdminRPCClient) WriteTmpConfig(tmpFileName string, configBytes []byte) error {
+	args := WriteConfigArgs{
+		TmpFileName: tmpFileName,
+		Buf:         configBytes,
+	}
+	reply := VoidReply{}
+
+	err := rpcClient.Call(adminServiceName+".WriteTmpConfig", &args, &reply)
+	logger.LogIf(context.Background(), err)
+	return err
+}
+
+// CommitConfig - Move the new config in tmpFileName onto config.json on a remote node.
+func (rpcClient *AdminRPCClient) CommitConfig(tmpFileName string) error {
+	args := CommitConfigArgs{FileName: tmpFileName}
+	reply := VoidReply{}
+
+	err := rpcClient.Call(adminServiceName+".CommitConfig", &args, &reply)
+	logger.LogIf(context.Background(), err)
+	return err
+}
+
+// NewAdminRPCClient - returns new admin RPC client.
+func NewAdminRPCClient(host *xnet.Host) (*AdminRPCClient, error) {
+	scheme := "http"
+	if globalIsSSL {
+		scheme = "https"
+	}
+
+	serviceURL := &xnet.URL{
+		Scheme: scheme,
+		Host:   host.String(),
+		Path:   adminServicePath,
+	}
+
+	var tlsConfig *tls.Config
+	if globalIsSSL {
+		tlsConfig = &tls.Config{
+			ServerName: host.Name,
+			RootCAs:    globalRootCAs,
+		}
+	}
+
+	rpcClient, err := NewRPCClient(
+		RPCClientArgs{
+			NewAuthTokenFunc: newAuthToken,
+			RPCVersion:       globalRPCAPIVersion,
+			ServiceName:      adminServiceName,
+			ServiceURL:       serviceURL,
+			TLSConfig:        tlsConfig,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &AdminRPCClient{rpcClient}, nil
 }
 
 // adminCmdRunner - abstracts local and remote execution of admin
 // commands like service stop and service restart.
 type adminCmdRunner interface {
-	Restart() error
+	SignalService(s serviceSignal) error
+	ReInitFormat(dryRun bool) error
 	ListLocks(bucket, prefix string, duration time.Duration) ([]VolumeLockInfo, error)
-	ReInitDisks() error
-	ServerInfoData() (ServerInfoData, error)
+	ServerInfo() (ServerInfoData, error)
 	GetConfig() ([]byte, error)
 	WriteTmpConfig(tmpFileName string, configBytes []byte) error
 	CommitConfig(tmpFileName string) error
 }
 
-// Restart - Sends a message over channel to the go-routine
-// responsible for restarting the process.
-func (lc localAdminClient) Restart() error {
-	globalServiceSignalCh <- serviceRestart
-	return nil
-}
-
-// ListLocks - Fetches lock information from local lock instrumentation.
-func (lc localAdminClient) ListLocks(bucket, prefix string, duration time.Duration) ([]VolumeLockInfo, error) {
-	return listLocksInfo(bucket, prefix, duration), nil
-}
-
-// Restart - Sends restart command to remote server via RPC.
-func (rc remoteAdminClient) Restart() error {
-	args := AuthRPCArgs{}
-	reply := AuthRPCReply{}
-	return rc.Call(serviceRestartRPC, &args, &reply)
-}
-
-// ListLocks - Sends list locks command to remote server via RPC.
-func (rc remoteAdminClient) ListLocks(bucket, prefix string, duration time.Duration) ([]VolumeLockInfo, error) {
-	listArgs := ListLocksQuery{
-		bucket:   bucket,
-		prefix:   prefix,
-		duration: duration,
-	}
-	var reply ListLocksReply
-	if err := rc.Call(listLocksRPC, &listArgs, &reply); err != nil {
-		return nil, err
-	}
-	return reply.volLocks, nil
-}
-
-// ReInitDisks - There is nothing to do here, heal format REST API
-// handler has already formatted and reinitialized the local disks.
-func (lc localAdminClient) ReInitDisks() error {
-	return nil
-}
-
-// ReInitDisks - Signals peers via RPC to reinitialize their disks and
-// object layer.
-func (rc remoteAdminClient) ReInitDisks() error {
-	args := AuthRPCArgs{}
-	reply := AuthRPCReply{}
-	return rc.Call(reInitDisksRPC, &args, &reply)
-}
-
-// ServerInfoData - Returns the server info of this server.
-func (lc localAdminClient) ServerInfoData() (sid ServerInfoData, e error) {
-	if globalBootTime.IsZero() {
-		return sid, errServerNotInitialized
-	}
-
-	// Build storage info
-	objLayer := newObjectLayerFn()
-	if objLayer == nil {
-		return sid, errServerNotInitialized
-	}
-	storage := objLayer.StorageInfo()
-
-	var arns []string
-	for queueArn := range globalEventNotifier.GetAllExternalTargets() {
-		arns = append(arns, queueArn)
-	}
-
-	return ServerInfoData{
-		StorageInfo: storage,
-		ConnStats:   globalConnStats.toServerConnStats(),
-		HTTPStats:   globalHTTPStats.toServerHTTPStats(),
-		Properties: ServerProperties{
-			Uptime:   UTCNow().Sub(globalBootTime),
-			Version:  Version,
-			CommitID: CommitID,
-			SQSARN:   arns,
-			Region:   globalServerConfig.GetRegion(),
-		},
-	}, nil
-}
-
-// ServerInfo - returns the server info of the server to which the RPC call is made.
-func (rc remoteAdminClient) ServerInfoData() (sid ServerInfoData, e error) {
-	args := AuthRPCArgs{}
-	reply := ServerInfoDataReply{}
-	err := rc.Call(serverInfoDataRPC, &args, &reply)
-	if err != nil {
-		return sid, err
-	}
-
-	return reply.ServerInfoData, nil
-}
-
-// GetConfig - returns config.json of the local server.
-func (lc localAdminClient) GetConfig() ([]byte, error) {
-	if globalServerConfig == nil {
-		return nil, fmt.Errorf("config not present")
-	}
-
-	return json.Marshal(globalServerConfig)
-}
-
-// GetConfig - returns config.json of the remote server.
-func (rc remoteAdminClient) GetConfig() ([]byte, error) {
-	args := AuthRPCArgs{}
-	reply := ConfigReply{}
-	if err := rc.Call(getConfigRPC, &args, &reply); err != nil {
-		return nil, err
-	}
-	return reply.Config, nil
-}
-
-// WriteTmpConfig - writes config file content to a temporary file on
-// the local server.
-func (lc localAdminClient) WriteTmpConfig(tmpFileName string, configBytes []byte) error {
-	return writeTmpConfigCommon(tmpFileName, configBytes)
-}
-
-// WriteTmpConfig - writes config file content to a temporary file on
-// a remote node.
-func (rc remoteAdminClient) WriteTmpConfig(tmpFileName string, configBytes []byte) error {
-	wArgs := WriteConfigArgs{
-		TmpFileName: tmpFileName,
-		Buf:         configBytes,
-	}
-
-	err := rc.Call(writeTmpConfigRPC, &wArgs, &WriteConfigReply{})
-	if err != nil {
-		errorIf(err, "Failed to write temporary config file.")
-		return err
-	}
-
-	return nil
-}
-
-// CommitConfig - Move the new config in tmpFileName onto config.json
-// on a local node.
-func (lc localAdminClient) CommitConfig(tmpFileName string) error {
-	configFile := getConfigFile()
-	tmpConfigFile := filepath.Join(getConfigDir(), tmpFileName)
-
-	err := os.Rename(tmpConfigFile, configFile)
-	errorIf(err, fmt.Sprintf("Failed to rename %s to %s", tmpConfigFile, configFile))
-	return err
-}
-
-// CommitConfig - Move the new config in tmpFileName onto config.json
-// on a remote node.
-func (rc remoteAdminClient) CommitConfig(tmpFileName string) error {
-	cArgs := CommitConfigArgs{
-		FileName: tmpFileName,
-	}
-	cReply := CommitConfigReply{}
-	err := rc.Call(commitConfigRPC, &cArgs, &cReply)
-	if err != nil {
-		errorIf(err, "Failed to rename config file.")
-		return err
-	}
-
-	return nil
-}
-
-// adminPeer - represents an entity that implements Restart methods.
+// adminPeer - represents an entity that implements admin API RPCs.
 type adminPeer struct {
 	addr      string
 	cmdRunner adminCmdRunner
+	isLocal   bool
 }
 
 // type alias for a collection of adminPeer.
@@ -236,37 +166,49 @@ type adminPeers []adminPeer
 
 // makeAdminPeers - helper function to construct a collection of adminPeer.
 func makeAdminPeers(endpoints EndpointList) (adminPeerList adminPeers) {
-	thisPeer := globalMinioAddr
-	if globalMinioHost == "" {
-		thisPeer = net.JoinHostPort("localhost", globalMinioPort)
+	localAddr := GetLocalPeer(endpoints)
+	if strings.HasPrefix(localAddr, "127.0.0.1:") {
+		// Use first IPv4 instead of loopback address.
+		localAddr = net.JoinHostPort(sortIPs(localIP4.ToSlice())[0], globalMinioPort)
 	}
 	adminPeerList = append(adminPeerList, adminPeer{
-		thisPeer,
-		localAdminClient{},
+		addr:      localAddr,
+		cmdRunner: localAdminClient{},
+		isLocal:   true,
 	})
 
-	hostSet := set.CreateStringSet(globalMinioAddr)
-	cred := globalServerConfig.GetCredential()
-	serviceEndpoint := path.Join(minioReservedBucketPath, adminPath)
-	for _, host := range GetRemotePeers(endpoints) {
-		if hostSet.Contains(host) {
-			continue
-		}
-		hostSet.Add(host)
+	for _, hostStr := range GetRemotePeers(endpoints) {
+		host, err := xnet.ParseHost(hostStr)
+		logger.FatalIf(err, "Unable to parse Admin RPC Host", context.Background())
+		rpcClient, err := NewAdminRPCClient(host)
+		logger.FatalIf(err, "Unable to initialize Admin RPC Client", context.Background())
 		adminPeerList = append(adminPeerList, adminPeer{
-			addr: host,
-			cmdRunner: &remoteAdminClient{newAuthRPCClient(authConfig{
-				accessKey:       cred.AccessKey,
-				secretKey:       cred.SecretKey,
-				serverAddr:      host,
-				serviceEndpoint: serviceEndpoint,
-				secureConn:      globalIsSSL,
-				serviceName:     "Admin",
-			})},
+			addr:      hostStr,
+			cmdRunner: rpcClient,
 		})
 	}
 
 	return adminPeerList
+}
+
+// peersReInitFormat - reinitialize remote object layers to new format.
+func peersReInitFormat(peers adminPeers, dryRun bool) error {
+	errs := make([]error, len(peers))
+
+	// Send ReInitFormat RPC call to all nodes.
+	// for local adminPeer this is a no-op.
+	wg := sync.WaitGroup{}
+	for i, peer := range peers {
+		wg.Add(1)
+		go func(idx int, peer adminPeer) {
+			defer wg.Done()
+			if !peer.isLocal {
+				errs[idx] = peer.cmdRunner.ReInitFormat(dryRun)
+			}
+		}(i, peer)
+	}
+	wg.Wait()
+	return nil
 }
 
 // Initialize global adminPeer collection.
@@ -274,11 +216,11 @@ func initGlobalAdminPeers(endpoints EndpointList) {
 	globalAdminPeers = makeAdminPeers(endpoints)
 }
 
-// invokeServiceCmd - Invoke Restart command.
+// invokeServiceCmd - Invoke Restart/Stop command.
 func invokeServiceCmd(cp adminPeer, cmd serviceSignal) (err error) {
 	switch cmd {
-	case serviceRestart:
-		err = cp.cmdRunner.Restart()
+	case serviceRestart, serviceStop:
+		err = cp.cmdRunner.SignalService(cmd)
 	}
 	return err
 }
@@ -352,24 +294,6 @@ func listPeerLocksInfo(peers adminPeers, bucket, prefix string, duration time.Du
 	return groupedLockInfos, nil
 }
 
-// reInitPeerDisks - reinitialize disks and object layer on peer servers to use the new format.
-func reInitPeerDisks(peers adminPeers) error {
-	errs := make([]error, len(peers))
-
-	// Send ReInitDisks RPC call to all nodes.
-	// for local adminPeer this is a no-op.
-	wg := sync.WaitGroup{}
-	for i, peer := range peers {
-		wg.Add(1)
-		go func(idx int, peer adminPeer) {
-			defer wg.Done()
-			errs[idx] = peer.cmdRunner.ReInitDisks()
-		}(i, peer)
-	}
-	wg.Wait()
-	return nil
-}
-
 // uptimeSlice - used to sort uptimes in chronological order.
 type uptimeSlice []struct {
 	err    error
@@ -406,7 +330,7 @@ func getPeerUptimes(peers adminPeers) (time.Duration, error) {
 		wg.Add(1)
 		go func(idx int, peer adminPeer) {
 			defer wg.Done()
-			serverInfoData, rpcErr := peer.cmdRunner.ServerInfoData()
+			serverInfoData, rpcErr := peer.cmdRunner.ServerInfo()
 			uptimes[idx].uptime, uptimes[idx].err = serverInfoData.Properties.Uptime, rpcErr
 		}(i, peer)
 	}
@@ -422,7 +346,7 @@ func getPeerUptimes(peers adminPeers) (time.Duration, error) {
 	latestUptime := time.Duration(0)
 	for _, uptime := range uptimes {
 		if uptime.err != nil {
-			errorIf(uptime.err, "Unable to fetch uptime")
+			logger.LogIf(context.Background(), uptime.err)
 			continue
 		}
 
@@ -466,7 +390,7 @@ func getPeerConfig(peers adminPeers) ([]byte, error) {
 	// Find the maximally occurring config among peers in a
 	// distributed setup.
 
-	serverConfigs := make([]serverConfigV13, len(peers))
+	serverConfigs := make([]serverConfig, len(peers))
 	for i, configBytes := range configs {
 		if errs[i] != nil {
 			continue
@@ -475,15 +399,17 @@ func getPeerConfig(peers adminPeers) ([]byte, error) {
 		// Unmarshal the received config files.
 		err := json.Unmarshal(configBytes, &serverConfigs[i])
 		if err != nil {
-			errorIf(err, "Failed to unmarshal serverConfig from ", peers[i].addr)
+			reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", peers[i].addr)
+			ctx := logger.SetReqInfo(context.Background(), reqInfo)
+			logger.LogIf(ctx, err)
 			return nil, err
 		}
 	}
 
 	configJSON, err := getValidServerConfig(serverConfigs, errs)
 	if err != nil {
-		errorIf(err, "Unable to find a valid server config")
-		return nil, errors.Trace(err)
+		logger.LogIf(context.Background(), err)
+		return nil, err
 	}
 
 	// Return the config.json that was present quorum or more
@@ -493,7 +419,7 @@ func getPeerConfig(peers adminPeers) ([]byte, error) {
 
 // getValidServerConfig - finds the server config that is present in
 // quorum or more number of servers.
-func getValidServerConfig(serverConfigs []serverConfigV13, errs []error) (scv serverConfigV13, e error) {
+func getValidServerConfig(serverConfigs []serverConfig, errs []error) (scv serverConfig, e error) {
 	// majority-based quorum
 	quorum := len(serverConfigs)/2 + 1
 
@@ -536,7 +462,7 @@ func getValidServerConfig(serverConfigs []serverConfigV13, errs []error) (scv se
 				// seen. See example above for
 				// clarity.
 				continue
-			} else if j < i && reflect.DeepEqual(serverConfigs[i], serverConfigs[j]) {
+			} else if j < i && serverConfigs[i].ConfigDiff(&serverConfigs[j]) == "" {
 				// serverConfigs[i] is equal to
 				// serverConfigs[j], update
 				// serverConfigs[j]'s counter since it
@@ -555,7 +481,7 @@ func getValidServerConfig(serverConfigs []serverConfigV13, errs []error) (scv se
 
 	// We find the maximally occurring server config and check if
 	// there is quorum.
-	var configJSON serverConfigV13
+	var configJSON serverConfig
 	maxOccurrence := 0
 	for i, count := range configCounter {
 		if maxOccurrence < count {

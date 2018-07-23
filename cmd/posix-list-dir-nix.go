@@ -22,7 +22,6 @@ import (
 	"os"
 	"path"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -112,32 +111,39 @@ var readDirBufPool = sync.Pool{
 
 // Return all the entries at the directory dirPath.
 func readDir(dirPath string) (entries []string, err error) {
+	return readDirN(dirPath, -1)
+}
+
+// Return count entries at the directory dirPath and all entries
+// if count is set to -1
+func readDirN(dirPath string, count int) (entries []string, err error) {
 	bufp := readDirBufPool.Get().(*[]byte)
 	buf := *bufp
 	defer readDirBufPool.Put(bufp)
 
 	d, err := os.Open(dirPath)
 	if err != nil {
-		// File is really not found.
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) || isSysErrNotDir(err) {
 			return nil, errFileNotFound
 		}
 		if os.IsPermission(err) {
 			return nil, errFileAccessDenied
-		}
-
-		// File path cannot be verified since one of the parents is a file.
-		if strings.Contains(err.Error(), "not a directory") {
-			return nil, errFileNotFound
 		}
 		return nil, err
 	}
 	defer d.Close()
 
 	fd := int(d.Fd())
-	for {
+
+	remaining := count
+	done := false
+
+	for !done {
 		nbuf, err := syscall.ReadDirent(fd, buf)
 		if err != nil {
+			if isSysErrNotDir(err) {
+				return nil, errFileNotFound
+			}
 			return nil, err
 		}
 		if nbuf <= 0 {
@@ -146,6 +152,13 @@ func readDir(dirPath string) (entries []string, err error) {
 		var tmpEntries []string
 		if tmpEntries, err = parseDirents(dirPath, buf[:nbuf]); err != nil {
 			return nil, err
+		}
+		if count > 0 {
+			if remaining <= len(tmpEntries) {
+				tmpEntries = tmpEntries[:remaining]
+				done = true
+			}
+			remaining -= len(tmpEntries)
 		}
 		entries = append(entries, tmpEntries...)
 	}

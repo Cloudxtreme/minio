@@ -127,7 +127,6 @@ spec:
           value: "minio123"
         ports:
         - containerPort: 9000
-          hostPort: 9000
         # Mount the volume into the pod
         volumeMounts:
         - name: data # must match the volume name, above
@@ -203,7 +202,7 @@ kubectl delete deployment minio-deployment \
 
 ## Minio分布式服务部署
 
-以下文档介绍了在Kubernetes上部署[分布式Minio](https://docs.minio.io/docs/zh_CN/distributed-minio-quickstart-guide)服务器的过程。 本示例使用Docker Hub的[官方Minio Docker镜像](https://hub.docker.com/r/minio/minio/~/dockerfile/)。
+以下文档介绍了在Kubernetes上部署[分布式Minio](https://docs.minio.io/cn/distributed-minio-quickstart-guide)服务器的过程。 本示例使用Docker Hub的[官方Minio Docker镜像](https://hub.docker.com/r/minio/minio/~/dockerfile/)。
 
 此示例使用以下Kubernetes的核心组件：
 
@@ -287,7 +286,6 @@ spec:
         - http://minio-3.minio.default.svc.cluster.local/data
         ports:
         - containerPort: 9000
-          hostPort: 9000
         # These volume mounts are persistent. Each pod in the PetSet
         # gets a volume mounted based on this field.
         volumeMounts:
@@ -470,7 +468,6 @@ spec:
           value: "/etc/credentials/application_default_credentials.json"
         ports:
         - containerPort: 9000
-          hostPort: 9000
         # Mount the volume into the pod
         volumeMounts:
         - name: gcs-credentials

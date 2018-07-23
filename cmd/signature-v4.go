@@ -35,6 +35,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/minio-go/pkg/s3utils"
 	sha256 "github.com/minio/sha256-simd"
 )
 
@@ -92,7 +93,7 @@ func getSignedHeaders(signedHeaders http.Header) string {
 //
 func getCanonicalRequest(extractedSignedHeaders http.Header, payload, queryStr, urlPath, method string) string {
 	rawQuery := strings.Replace(queryStr, "+", "%20", -1)
-	encodedPath := getURLEncodedName(urlPath)
+	encodedPath := s3utils.EncodePath(urlPath)
 	canonicalRequest := strings.Join([]string{
 		method,
 		encodedPath,
@@ -167,7 +168,7 @@ func doesPolicySignatureV4Match(formValues http.Header) APIErrorCode {
 	region := globalServerConfig.GetRegion()
 
 	// Parse credential tag.
-	credHeader, err := parseCredentialHeader("Credential=" + formValues.Get("X-Amz-Credential"))
+	credHeader, err := parseCredentialHeader("Credential="+formValues.Get("X-Amz-Credential"), region)
 	if err != ErrNone {
 		return ErrMissingFields
 	}
@@ -177,14 +178,8 @@ func doesPolicySignatureV4Match(formValues http.Header) APIErrorCode {
 		return ErrInvalidAccessKeyID
 	}
 
-	// Verify if the region is valid.
-	sRegion := credHeader.scope.region
-	if !isValidRegion(sRegion, region) {
-		return ErrInvalidRegion
-	}
-
 	// Get signing key.
-	signingKey := getSigningKey(cred.SecretKey, credHeader.scope.date, sRegion)
+	signingKey := getSigningKey(cred.SecretKey, credHeader.scope.date, credHeader.scope.region)
 
 	// Get signature.
 	newSignature := getSignature(signingKey, formValues.Get("Policy"))
@@ -209,7 +204,7 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	req := *r
 
 	// Parse request query string.
-	pSignValues, err := parsePreSignV4(req.URL.Query())
+	pSignValues, err := parsePreSignV4(req.URL.Query(), region)
 	if err != ErrNone {
 		return err
 	}
@@ -217,16 +212,6 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	// Verify if the access key id matches.
 	if pSignValues.Credential.accessKey != cred.AccessKey {
 		return ErrInvalidAccessKeyID
-	}
-
-	// Verify if region is valid.
-	sRegion := pSignValues.Credential.scope.region
-	// Should validate region, only if region is set.
-	if region == "" {
-		region = sRegion
-	}
-	if !isValidRegion(sRegion, region) {
-		return ErrInvalidRegion
 	}
 
 	// Extract all the signed headers along with its values.
@@ -260,10 +245,16 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	query.Set("X-Amz-Date", t.Format(iso8601Format))
 	query.Set("X-Amz-Expires", strconv.Itoa(expireSeconds))
 	query.Set("X-Amz-SignedHeaders", getSignedHeaders(extractedSignedHeaders))
-	query.Set("X-Amz-Credential", cred.AccessKey+"/"+getScope(t, sRegion))
+	query.Set("X-Amz-Credential", cred.AccessKey+"/"+getScope(t, pSignValues.Credential.scope.region))
 
 	// Save other headers available in the request parameters.
 	for k, v := range req.URL.Query() {
+
+		// Handle the metadata in presigned put query string
+		if strings.Contains(strings.ToLower(k), "x-amz-meta-") {
+			query.Set(k, v[0])
+		}
+
 		if strings.HasPrefix(strings.ToLower(k), "x-amz") {
 			continue
 		}
@@ -292,7 +283,7 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	// Verify if sha256 payload query is same.
 	if req.URL.Query().Get("X-Amz-Content-Sha256") != "" {
 		if req.URL.Query().Get("X-Amz-Content-Sha256") != query.Get("X-Amz-Content-Sha256") {
-			return ErrSignatureDoesNotMatch
+			return ErrContentSHA256Mismatch
 		}
 	}
 
@@ -305,7 +296,7 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 	presignedStringToSign := getStringToSign(presignedCanonicalReq, t, pSignValues.Credential.getScope())
 
 	// Get hmac presigned signing key.
-	presignedSigningKey := getSigningKey(cred.SecretKey, pSignValues.Credential.scope.date, region)
+	presignedSigningKey := getSigningKey(cred.SecretKey, pSignValues.Credential.scope.date, pSignValues.Credential.scope.region)
 
 	// Get new signature.
 	newSignature := getSignature(presignedSigningKey, presignedStringToSign)
@@ -331,7 +322,7 @@ func doesSignatureMatch(hashedPayload string, r *http.Request, region string) AP
 	v4Auth := req.Header.Get("Authorization")
 
 	// Parse signature version '4' header.
-	signV4Values, err := parseSignV4(v4Auth)
+	signV4Values, err := parseSignV4(v4Auth, region)
 	if err != ErrNone {
 		return err
 	}
@@ -345,20 +336,6 @@ func doesSignatureMatch(hashedPayload string, r *http.Request, region string) AP
 	// Verify if the access key id matches.
 	if signV4Values.Credential.accessKey != cred.AccessKey {
 		return ErrInvalidAccessKeyID
-	}
-
-	// Verify if region is valid.
-	sRegion := signV4Values.Credential.scope.region
-	// Region is set to be empty, we use whatever was sent by the
-	// request and proceed further. This is a work-around to address
-	// an important problem for ListBuckets() getting signed with
-	// different regions.
-	if region == "" {
-		region = sRegion
-	}
-	// Should validate region, only if region is set.
-	if !isValidRegion(sRegion, region) {
-		return ErrInvalidRegion
 	}
 
 	// Extract date, if not present throw error.
@@ -384,7 +361,7 @@ func doesSignatureMatch(hashedPayload string, r *http.Request, region string) AP
 	stringToSign := getStringToSign(canonicalRequest, t, signV4Values.Credential.getScope())
 
 	// Get hmac signing key.
-	signingKey := getSigningKey(cred.SecretKey, signV4Values.Credential.scope.date, region)
+	signingKey := getSigningKey(cred.SecretKey, signV4Values.Credential.scope.date, signV4Values.Credential.scope.region)
 
 	// Calculate signature.
 	newSignature := getSignature(signingKey, stringToSign)

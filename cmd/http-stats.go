@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"go.uber.org/atomic"
 )
 
@@ -188,6 +190,8 @@ func (st *HTTPStats) updateStats(r *http.Request, w *httpResponseRecorder, durat
 			st.successDELETEs.Duration.Add(durationSecs)
 		}
 	}
+	// Increment the prometheus http request response histogram with appropriate label
+	httpRequestsDuration.With(prometheus.Labels{"request_type": r.Method}).Observe(durationSecs)
 }
 
 // Prepare new HTTPStats structure

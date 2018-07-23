@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,12 @@ package cmd
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"runtime"
@@ -30,14 +31,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dustin/go-humanize"
+	humanize "github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/rpc/v2/json2"
-	"github.com/minio/minio-go/pkg/policy"
+	miniogopolicy "github.com/minio/minio-go/pkg/policy"
+	"github.com/minio/minio-go/pkg/s3utils"
 	"github.com/minio/minio/browser"
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
-	"github.com/minio/minio/pkg/errors"
+	"github.com/minio/minio/pkg/dns"
+	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/policy"
 )
 
 // WebGenericArgs - empty struct for calls that don't accept arguments
@@ -98,7 +103,7 @@ type StorageInfoRep struct {
 }
 
 // StorageInfo - web call to gather storage usage statistics.
-func (web *webAPIHandlers) StorageInfo(r *http.Request, args *AuthRPCArgs, reply *StorageInfoRep) error {
+func (web *webAPIHandlers) StorageInfo(r *http.Request, args *AuthArgs, reply *StorageInfoRep) error {
 	objectAPI := web.ObjectAPI()
 	if objectAPI == nil {
 		return toJSONError(errServerNotInitialized)
@@ -106,7 +111,7 @@ func (web *webAPIHandlers) StorageInfo(r *http.Request, args *AuthRPCArgs, reply
 	if !isHTTPRequestValid(r) {
 		return toJSONError(errAuthentication)
 	}
-	reply.StorageInfo = objectAPI.StorageInfo()
+	reply.StorageInfo = objectAPI.StorageInfo(context.Background())
 	reply.UIVersion = browser.UIVersion
 	return nil
 }
@@ -131,13 +136,27 @@ func (web *webAPIHandlers) MakeBucket(r *http.Request, args *MakeBucketArgs, rep
 		return toJSONError(errInvalidBucketName)
 	}
 
-	bucketLock := globalNSMutex.NewNSLock(args.BucketName, "")
-	if err := bucketLock.GetLock(globalObjectTimeout); err != nil {
-		return toJSONError(errOperationTimedOut)
-	}
-	defer bucketLock.Unlock()
+	if globalDNSConfig != nil {
+		if _, err := globalDNSConfig.Get(args.BucketName); err != nil {
+			if err == dns.ErrNoEntriesFound {
+				// Proceed to creating a bucket.
+				if err = objectAPI.MakeBucketWithLocation(context.Background(), args.BucketName, globalServerConfig.GetRegion()); err != nil {
+					return toJSONError(err)
+				}
+				if err = globalDNSConfig.Put(args.BucketName); err != nil {
+					objectAPI.DeleteBucket(context.Background(), args.BucketName)
+					return toJSONError(err)
+				}
 
-	if err := objectAPI.MakeBucketWithLocation(args.BucketName, globalServerConfig.GetRegion()); err != nil {
+				reply.UIVersion = browser.UIVersion
+				return nil
+			}
+			return toJSONError(err)
+		}
+		return toJSONError(errBucketAlreadyExists)
+	}
+
+	if err := objectAPI.MakeBucketWithLocation(context.Background(), args.BucketName, globalServerConfig.GetRegion()); err != nil {
 		return toJSONError(err, args.BucketName)
 	}
 
@@ -160,15 +179,27 @@ func (web *webAPIHandlers) DeleteBucket(r *http.Request, args *RemoveBucketArgs,
 		return toJSONError(errAuthentication)
 	}
 
-	bucketLock := globalNSMutex.NewNSLock(args.BucketName, "")
-	if err := bucketLock.GetLock(globalObjectTimeout); err != nil {
-		return toJSONError(errOperationTimedOut)
-	}
-	defer bucketLock.Unlock()
+	ctx := context.Background()
 
-	err := objectAPI.DeleteBucket(args.BucketName)
-	if err != nil {
+	deleteBucket := objectAPI.DeleteBucket
+	if web.CacheAPI() != nil {
+		deleteBucket = web.CacheAPI().DeleteBucket
+	}
+
+	if err := deleteBucket(ctx, args.BucketName); err != nil {
 		return toJSONError(err, args.BucketName)
+	}
+
+	globalNotificationSys.RemoveNotification(args.BucketName)
+	globalPolicySys.Remove(args.BucketName)
+	globalNotificationSys.DeleteBucket(ctx, args.BucketName)
+
+	if globalDNSConfig != nil {
+		if err := globalDNSConfig.Delete(args.BucketName); err != nil {
+			// Deleting DNS entry failed, attempt to create the bucket again.
+			objectAPI.MakeBucketWithLocation(ctx, args.BucketName, "")
+			return toJSONError(err)
+		}
 	}
 
 	reply.UIVersion = browser.UIVersion
@@ -195,20 +226,40 @@ func (web *webAPIHandlers) ListBuckets(r *http.Request, args *WebGenericArgs, re
 	if objectAPI == nil {
 		return toJSONError(errServerNotInitialized)
 	}
+	listBuckets := objectAPI.ListBuckets
+	if web.CacheAPI() != nil {
+		listBuckets = web.CacheAPI().ListBuckets
+	}
 	authErr := webRequestAuthenticate(r)
 	if authErr != nil {
 		return toJSONError(authErr)
 	}
-	buckets, err := objectAPI.ListBuckets()
-	if err != nil {
-		return toJSONError(err)
+	// If etcd, dns federation configured list buckets from etcd.
+	if globalDNSConfig != nil {
+		dnsBuckets, err := globalDNSConfig.List()
+		if err != nil {
+			return toJSONError(err)
+		}
+		for _, dnsRecord := range dnsBuckets {
+			bucketName := strings.Trim(dnsRecord.Key, "/")
+			reply.Buckets = append(reply.Buckets, WebBucketInfo{
+				Name:         bucketName,
+				CreationDate: dnsRecord.CreationDate,
+			})
+		}
+	} else {
+		buckets, err := listBuckets(context.Background())
+		if err != nil {
+			return toJSONError(err)
+		}
+		for _, bucket := range buckets {
+			reply.Buckets = append(reply.Buckets, WebBucketInfo{
+				Name:         bucket.Name,
+				CreationDate: bucket.Created,
+			})
+		}
 	}
-	for _, bucket := range buckets {
-		reply.Buckets = append(reply.Buckets, WebBucketInfo{
-			Name:         bucket.Name,
-			CreationDate: bucket.Created,
-		})
-	}
+
 	reply.UIVersion = browser.UIVersion
 	return nil
 }
@@ -248,27 +299,42 @@ func (web *webAPIHandlers) ListObjects(r *http.Request, args *ListObjectsArgs, r
 	if objectAPI == nil {
 		return toJSONError(errServerNotInitialized)
 	}
-	prefix := args.Prefix + "test" // To test if GetObject/PutObject with the specified prefix is allowed.
-	readable := isBucketActionAllowed("s3:GetObject", args.BucketName, prefix)
-	writable := isBucketActionAllowed("s3:PutObject", args.BucketName, prefix)
-	authErr := webRequestAuthenticate(r)
-	switch {
-	case authErr == errAuthentication:
-		return toJSONError(authErr)
-	case authErr == nil:
-		break
-	case readable && writable:
-		reply.Writable = true
-		break
-	case readable:
-		break
-	case writable:
-		reply.Writable = true
-		return nil
-	default:
-		return errAuthentication
+	listObjects := objectAPI.ListObjects
+	if web.CacheAPI() != nil {
+		listObjects = web.CacheAPI().ListObjects
 	}
-	lo, err := objectAPI.ListObjects(args.BucketName, args.Prefix, args.Marker, slashSeparator, 1000)
+
+	// Check if anonymous (non-owner) has access to download objects.
+	readable := globalPolicySys.IsAllowed(policy.Args{
+		Action:          policy.GetObjectAction,
+		BucketName:      args.BucketName,
+		ConditionValues: getConditionValues(r, ""),
+		IsOwner:         false,
+		ObjectName:      args.Prefix + "/",
+	})
+	// Check if anonymous (non-owner) has access to upload objects.
+	writable := globalPolicySys.IsAllowed(policy.Args{
+		Action:          policy.PutObjectAction,
+		BucketName:      args.BucketName,
+		ConditionValues: getConditionValues(r, ""),
+		IsOwner:         false,
+		ObjectName:      args.Prefix + "/",
+	})
+
+	if authErr := webRequestAuthenticate(r); authErr != nil {
+		if authErr == errAuthentication {
+			return toJSONError(authErr)
+		}
+
+		// Error out anonymous (non-owner) has no access download or upload objects.
+		if !readable && !writable {
+			return errAuthentication
+		}
+
+		reply.Writable = writable
+	}
+
+	lo, err := listObjects(context.Background(), args.BucketName, args.Prefix, args.Marker, slashSeparator, 1000)
 	if err != nil {
 		return &json2.Error{Message: err.Error()}
 	}
@@ -312,6 +378,10 @@ func (web *webAPIHandlers) RemoveObject(r *http.Request, args *RemoveObjectArgs,
 	if objectAPI == nil {
 		return toJSONError(errServerNotInitialized)
 	}
+	listObjects := objectAPI.ListObjects
+	if web.CacheAPI() != nil {
+		listObjects = web.CacheAPI().ListObjects
+	}
 	if !isHTTPRequestValid(r) {
 		return toJSONError(errAuthentication)
 	}
@@ -325,7 +395,14 @@ next:
 	for _, objectName := range args.Objects {
 		// If not a directory, remove the object.
 		if !hasSuffix(objectName, slashSeparator) && objectName != "" {
-			if err = deleteObject(objectAPI, args.BucketName, objectName, r); err != nil {
+			// Deny if WORM is enabled
+			if globalWORMEnabled {
+				if _, err = objectAPI.GetObjectInfo(context.Background(), args.BucketName, objectName); err == nil {
+					return toJSONError(errMethodNotAllowed)
+				}
+			}
+
+			if err = deleteObject(nil, objectAPI, web.CacheAPI(), args.BucketName, objectName, r); err != nil {
 				break next
 			}
 			continue
@@ -335,13 +412,13 @@ next:
 		marker := ""
 		for {
 			var lo ListObjectsInfo
-			lo, err = objectAPI.ListObjects(args.BucketName, objectName, marker, "", 1000)
+			lo, err = listObjects(context.Background(), args.BucketName, objectName, marker, "", 1000)
 			if err != nil {
 				break next
 			}
 			marker = lo.NextMarker
 			for _, obj := range lo.Objects {
-				err = deleteObject(objectAPI, args.BucketName, obj.Name, r)
+				err = deleteObject(nil, objectAPI, web.CacheAPI(), args.BucketName, obj.Name, r)
 				if err != nil {
 					break next
 				}
@@ -377,9 +454,6 @@ type LoginRep struct {
 func (web *webAPIHandlers) Login(r *http.Request, args *LoginArgs, reply *LoginRep) error {
 	token, err := authenticateWeb(args.Username, args.Password)
 	if err != nil {
-		// Make sure to log errors related to browser login,
-		// for security and auditing reasons.
-		errorIf(err, "Unable to login request from %s", r.RemoteAddr)
 		return toJSONError(err)
 	}
 
@@ -399,7 +473,10 @@ func (web webAPIHandlers) GenerateAuth(r *http.Request, args *WebGenericArgs, re
 	if !isHTTPRequestValid(r) {
 		return toJSONError(errAuthentication)
 	}
-	cred := auth.MustGetNewCredentials()
+	cred, err := auth.GetNewCredentials()
+	if err != nil {
+		return toJSONError(err)
+	}
 	reply.AccessKey = cred.AccessKey
 	reply.SecretKey = cred.SecretKey
 	reply.UIVersion = browser.UIVersion
@@ -426,7 +503,7 @@ func (web *webAPIHandlers) SetAuth(r *http.Request, args *SetAuthArgs, reply *Se
 	}
 
 	// If creds are set through ENV disallow changing credentials.
-	if globalIsEnvCreds {
+	if globalIsEnvCreds || globalWORMEnabled {
 		return toJSONError(errChangeCredNotAllowed)
 	}
 
@@ -435,53 +512,33 @@ func (web *webAPIHandlers) SetAuth(r *http.Request, args *SetAuthArgs, reply *Se
 		return toJSONError(err)
 	}
 
-	// Notify all other Minio peers to update credentials
-	errsMap := updateCredsOnPeers(creds)
+	// Acquire lock before updating global configuration.
+	globalServerConfigMu.Lock()
+	defer globalServerConfigMu.Unlock()
 
-	// Update local credentials
+	// Update credentials in memory
 	prevCred := globalServerConfig.SetCredential(creds)
 
 	// Persist updated credentials.
-	if err = globalServerConfig.Save(); err != nil {
+	if err = globalServerConfig.Save(getConfigFile()); err != nil {
 		// Save the current creds when failed to update.
 		globalServerConfig.SetCredential(prevCred)
-
-		errsMap[globalMinioAddr] = err
-	}
-
-	// Log all the peer related error messages, and populate the
-	// PeerErrMsgs map.
-	reply.PeerErrMsgs = make(map[string]string)
-	for svr, errVal := range errsMap {
-		tErr := fmt.Errorf("Unable to change credentials on %s: %v", svr, errVal)
-		errorIf(tErr, "Credentials change could not be propagated successfully!")
-		reply.PeerErrMsgs[svr] = errVal.Error()
-	}
-
-	// If we were unable to update locally, we return an error to the user/browser.
-	if errsMap[globalMinioAddr] != nil {
-		// Since the error message may be very long to display
-		// on the browser, we tell the user to check the
-		// server logs.
-		return toJSONError(fmt.Errorf("unexpected error(s) occurred - please check minio server logs"))
-	}
-
-	// As we have updated access/secret key, generate new auth token.
-	token, err := authenticateWeb(creds.AccessKey, creds.SecretKey)
-	if err != nil {
-		// Did we have peer errors?
-		if len(errsMap) > 0 {
-			err = fmt.Errorf(
-				"we gave up due to: '%s', but there were more errors. Please check minio server logs",
-				err.Error(),
-			)
-		}
-
+		logger.LogIf(context.Background(), err)
 		return toJSONError(err)
 	}
 
-	reply.Token = token
-	reply.UIVersion = browser.UIVersion
+	if errs := globalNotificationSys.SetCredentials(creds); len(errs) != 0 {
+		reply.PeerErrMsgs = make(map[string]string)
+		for host, err := range errs {
+			err = fmt.Errorf("Unable to update credentials on server %v: %v", host, err)
+			logger.LogIf(context.Background(), err)
+			reply.PeerErrMsgs[host.String()] = err.Error()
+		}
+	} else {
+		reply.Token = newAuthToken()
+		reply.UIVersion = browser.UIVersion
+	}
+
 	return nil
 }
 
@@ -536,18 +593,31 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	putObject := objectAPI.PutObject
+	if web.CacheAPI() != nil {
+		putObject = web.CacheAPI().PutObject
+	}
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 	object := vars["object"]
 
-	authErr := webRequestAuthenticate(r)
-	if authErr == errAuthentication {
-		writeWebErrorResponse(w, errAuthentication)
-		return
-	}
-	if authErr != nil && !isBucketActionAllowed("s3:PutObject", bucket, object) {
-		writeWebErrorResponse(w, errAuthentication)
-		return
+	if authErr := webRequestAuthenticate(r); authErr != nil {
+		if authErr == errAuthentication {
+			writeWebErrorResponse(w, errAuthentication)
+			return
+		}
+
+		// Check if anonymous (non-owner) has access to upload objects.
+		if !globalPolicySys.IsAllowed(policy.Args{
+			Action:          policy.PutObjectAction,
+			BucketName:      bucket,
+			ConditionValues: getConditionValues(r, ""),
+			IsOwner:         false,
+			ObjectName:      object,
+		}) {
+			writeWebErrorResponse(w, errAuthentication)
+			return
+		}
 	}
 
 	// Require Content-Length to be set in the request
@@ -558,19 +628,11 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract incoming metadata if any.
-	metadata, err := extractMetadataFromHeader(r.Header)
+	metadata, err := extractMetadata(context.Background(), r)
 	if err != nil {
 		writeErrorResponse(w, ErrInternalError, r.URL)
 		return
 	}
-
-	// Lock the object.
-	objectLock := globalNSMutex.NewNSLock(bucket, object)
-	if objectLock.GetLock(globalObjectTimeout) != nil {
-		writeWebErrorResponse(w, errOperationTimedOut)
-		return
-	}
-	defer objectLock.Unlock()
 
 	hashReader, err := hash.NewReader(r.Body, size, "", "")
 	if err != nil {
@@ -578,18 +640,26 @@ func (web *webAPIHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	objInfo, err := objectAPI.PutObject(bucket, object, hashReader, metadata)
+	// Deny if WORM is enabled
+	if globalWORMEnabled {
+		if _, err = objectAPI.GetObjectInfo(context.Background(), bucket, object); err == nil {
+			writeWebErrorResponse(w, errMethodNotAllowed)
+			return
+		}
+	}
+
+	objInfo, err := putObject(context.Background(), bucket, object, hashReader, metadata)
 	if err != nil {
 		writeWebErrorResponse(w, err)
 		return
 	}
 
 	// Notify object created event.
-	eventNotify(eventData{
-		Type:      ObjectCreatedPut,
-		Bucket:    bucket,
-		ObjInfo:   objInfo,
-		ReqParams: extractReqParams(r),
+	sendEvent(eventArgs{
+		EventName:  event.ObjectCreatedPut,
+		BucketName: bucket,
+		Object:     objInfo,
+		ReqParams:  extractReqParams(r),
 	})
 }
 
@@ -606,23 +676,28 @@ func (web *webAPIHandlers) Download(w http.ResponseWriter, r *http.Request) {
 	object := vars["object"]
 	token := r.URL.Query().Get("token")
 
-	if !isAuthTokenValid(token) && !isBucketActionAllowed("s3:GetObject", bucket, object) {
-		writeWebErrorResponse(w, errAuthentication)
-		return
+	if !isAuthTokenValid(token) {
+		// Check if anonymous (non-owner) has access to download objects.
+		if !globalPolicySys.IsAllowed(policy.Args{
+			Action:          policy.GetObjectAction,
+			BucketName:      bucket,
+			ConditionValues: getConditionValues(r, ""),
+			IsOwner:         false,
+			ObjectName:      object,
+		}) {
+			writeWebErrorResponse(w, errAuthentication)
+			return
+		}
 	}
 
+	getObject := objectAPI.GetObject
+	if web.CacheAPI() != nil {
+		getObject = web.CacheAPI().GetObject
+	}
 	// Add content disposition.
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", path.Base(object)))
 
-	// Lock the object before reading.
-	objectLock := globalNSMutex.NewNSLock(bucket, object)
-	if objectLock.GetRLock(globalObjectTimeout) != nil {
-		writeWebErrorResponse(w, errOperationTimedOut)
-		return
-	}
-	defer objectLock.RUnlock()
-
-	if err := objectAPI.GetObject(bucket, object, 0, -1, w); err != nil {
+	if err := getObject(context.Background(), bucket, object, 0, -1, w, ""); err != nil {
 		/// No need to print error, response writer already written to.
 		return
 	}
@@ -644,7 +719,14 @@ func (web *webAPIHandlers) DownloadZip(w http.ResponseWriter, r *http.Request) {
 		writeWebErrorResponse(w, errServerNotInitialized)
 		return
 	}
-
+	getObject := objectAPI.GetObject
+	if web.CacheAPI() != nil {
+		getObject = web.CacheAPI().GetObject
+	}
+	listObjects := objectAPI.ListObjects
+	if web.CacheAPI() != nil {
+		listObjects = web.CacheAPI().ListObjects
+	}
 	// Auth is done after reading the body to accommodate for anonymous requests
 	// when bucket policy is enabled.
 	var args DownloadZipArgs
@@ -658,7 +740,14 @@ func (web *webAPIHandlers) DownloadZip(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if !isAuthTokenValid(token) {
 		for _, object := range args.Objects {
-			if !isBucketActionAllowed("s3:GetObject", args.BucketName, pathJoin(args.Prefix, object)) {
+			// Check if anonymous (non-owner) has access to download objects.
+			if !globalPolicySys.IsAllowed(policy.Args{
+				Action:          policy.GetObjectAction,
+				BucketName:      args.BucketName,
+				ConditionValues: getConditionValues(r, ""),
+				IsOwner:         false,
+				ObjectName:      pathJoin(args.Prefix, object),
+			}) {
 				writeWebErrorResponse(w, errAuthentication)
 				return
 			}
@@ -667,11 +756,14 @@ func (web *webAPIHandlers) DownloadZip(w http.ResponseWriter, r *http.Request) {
 
 	archive := zip.NewWriter(w)
 	defer archive.Close()
-
+	getObjectInfo := objectAPI.GetObjectInfo
+	if web.CacheAPI() != nil {
+		getObjectInfo = web.CacheAPI().GetObjectInfo
+	}
 	for _, object := range args.Objects {
 		// Writes compressed object file to the response.
 		zipit := func(objectName string) error {
-			info, err := objectAPI.GetObjectInfo(args.BucketName, objectName)
+			info, err := getObjectInfo(context.Background(), args.BucketName, objectName)
 			if err != nil {
 				return err
 			}
@@ -686,7 +778,7 @@ func (web *webAPIHandlers) DownloadZip(w http.ResponseWriter, r *http.Request) {
 				writeWebErrorResponse(w, errUnexpected)
 				return err
 			}
-			return objectAPI.GetObject(args.BucketName, objectName, 0, info.Size, writer)
+			return getObject(context.Background(), args.BucketName, objectName, 0, info.Size, writer, "")
 		}
 
 		if !hasSuffix(object, slashSeparator) {
@@ -702,7 +794,7 @@ func (web *webAPIHandlers) DownloadZip(w http.ResponseWriter, r *http.Request) {
 		// date to the response writer.
 		marker := ""
 		for {
-			lo, err := objectAPI.ListObjects(args.BucketName, pathJoin(args.Prefix, object), marker, "", 1000)
+			lo, err := listObjects(context.Background(), args.BucketName, pathJoin(args.Prefix, object), marker, "", 1000)
 			if err != nil {
 				return
 			}
@@ -728,40 +820,8 @@ type GetBucketPolicyArgs struct {
 
 // GetBucketPolicyRep - get bucket policy reply.
 type GetBucketPolicyRep struct {
-	UIVersion string              `json:"uiVersion"`
-	Policy    policy.BucketPolicy `json:"policy"`
-}
-
-func readBucketAccessPolicy(objAPI ObjectLayer, bucketName string) (policy.BucketAccessPolicy, error) {
-	bucketPolicyReader, err := readBucketPolicyJSON(bucketName, objAPI)
-	if err != nil {
-		if _, ok := err.(BucketPolicyNotFound); ok {
-			return policy.BucketAccessPolicy{Version: "2012-10-17"}, nil
-		}
-		return policy.BucketAccessPolicy{}, err
-	}
-
-	bucketPolicyBuf, err := ioutil.ReadAll(bucketPolicyReader)
-	if err != nil {
-		return policy.BucketAccessPolicy{}, err
-	}
-
-	policyInfo := policy.BucketAccessPolicy{}
-	err = json.Unmarshal(bucketPolicyBuf, &policyInfo)
-	if err != nil {
-		return policy.BucketAccessPolicy{}, err
-	}
-
-	return policyInfo, nil
-
-}
-
-func getBucketAccessPolicy(objAPI ObjectLayer, bucketName string) (policy.BucketAccessPolicy, error) {
-	// FIXME: remove this code when S3 layer for gateway and server is unified.
-	if layer, ok := objAPI.(GatewayLayer); ok {
-		return layer.GetBucketPolicies(bucketName)
-	}
-	return readBucketAccessPolicy(objAPI, bucketName)
+	UIVersion string                     `json:"uiVersion"`
+	Policy    miniogopolicy.BucketPolicy `json:"policy"`
 }
 
 // GetBucketPolicy - get bucket policy for the requested prefix.
@@ -775,16 +835,21 @@ func (web *webAPIHandlers) GetBucketPolicy(r *http.Request, args *GetBucketPolic
 		return toJSONError(errAuthentication)
 	}
 
-	var policyInfo, err = getBucketAccessPolicy(objectAPI, args.BucketName)
+	bucketPolicy, err := objectAPI.GetBucketPolicy(context.Background(), args.BucketName)
 	if err != nil {
-		_, ok := errors.Cause(err).(PolicyNotFound)
-		if !ok {
+		if _, ok := err.(BucketPolicyNotFound); !ok {
 			return toJSONError(err, args.BucketName)
 		}
 	}
 
+	policyInfo, err := PolicyToBucketAccessPolicy(bucketPolicy)
+	if err != nil {
+		// This should not happen.
+		return toJSONError(err, args.BucketName)
+	}
+
 	reply.UIVersion = browser.UIVersion
-	reply.Policy = policy.GetPolicy(policyInfo.Statements, args.BucketName, args.Prefix)
+	reply.Policy = miniogopolicy.GetPolicy(policyInfo.Statements, args.BucketName, args.Prefix)
 
 	return nil
 }
@@ -796,8 +861,9 @@ type ListAllBucketPoliciesArgs struct {
 
 // BucketAccessPolicy - Collection of canned bucket policy at a given prefix.
 type BucketAccessPolicy struct {
-	Prefix string              `json:"prefix"`
-	Policy policy.BucketPolicy `json:"policy"`
+	Bucket string                     `json:"bucket"`
+	Prefix string                     `json:"prefix"`
+	Policy miniogopolicy.BucketPolicy `json:"policy"`
 }
 
 // ListAllBucketPoliciesRep - get all bucket policy reply.
@@ -806,7 +872,7 @@ type ListAllBucketPoliciesRep struct {
 	Policies  []BucketAccessPolicy `json:"policies"`
 }
 
-// GetllBucketPolicy - get all bucket policy.
+// ListAllBucketPolicies - get all bucket policy.
 func (web *webAPIHandlers) ListAllBucketPolicies(r *http.Request, args *ListAllBucketPoliciesArgs, reply *ListAllBucketPoliciesRep) error {
 	objectAPI := web.ObjectAPI()
 	if objectAPI == nil {
@@ -817,32 +883,42 @@ func (web *webAPIHandlers) ListAllBucketPolicies(r *http.Request, args *ListAllB
 		return toJSONError(errAuthentication)
 	}
 
-	var policyInfo, err = getBucketAccessPolicy(objectAPI, args.BucketName)
+	bucketPolicy, err := objectAPI.GetBucketPolicy(context.Background(), args.BucketName)
 	if err != nil {
-		_, ok := errors.Cause(err).(PolicyNotFound)
-		if !ok {
+		if _, ok := err.(BucketPolicyNotFound); !ok {
 			return toJSONError(err, args.BucketName)
 		}
 	}
+
+	policyInfo, err := PolicyToBucketAccessPolicy(bucketPolicy)
+	if err != nil {
+		// This should not happen.
+		return toJSONError(err, args.BucketName)
+	}
+
 	reply.UIVersion = browser.UIVersion
-	for prefix, policy := range policy.GetPolicies(policyInfo.Statements, args.BucketName) {
+	for prefix, policy := range miniogopolicy.GetPolicies(policyInfo.Statements, args.BucketName, "") {
+		bucketName, objectPrefix := urlPath2BucketObjectName(prefix)
+		objectPrefix = strings.TrimSuffix(objectPrefix, "*")
 		reply.Policies = append(reply.Policies, BucketAccessPolicy{
-			Prefix: prefix,
+			Bucket: bucketName,
+			Prefix: objectPrefix,
 			Policy: policy,
 		})
 	}
+
 	return nil
 }
 
-// SetBucketPolicyArgs - set bucket policy args.
-type SetBucketPolicyArgs struct {
+// SetBucketPolicyWebArgs - set bucket policy args.
+type SetBucketPolicyWebArgs struct {
 	BucketName string `json:"bucketName"`
 	Prefix     string `json:"prefix"`
 	Policy     string `json:"policy"`
 }
 
 // SetBucketPolicy - set bucket policy.
-func (web *webAPIHandlers) SetBucketPolicy(r *http.Request, args *SetBucketPolicyArgs, reply *WebGenericRep) error {
+func (web *webAPIHandlers) SetBucketPolicy(r *http.Request, args *SetBucketPolicyWebArgs, reply *WebGenericRep) error {
 	objectAPI := web.ObjectAPI()
 	reply.UIVersion = browser.UIVersion
 
@@ -854,63 +930,53 @@ func (web *webAPIHandlers) SetBucketPolicy(r *http.Request, args *SetBucketPolic
 		return toJSONError(errAuthentication)
 	}
 
-	bucketP := policy.BucketPolicy(args.Policy)
-	if !bucketP.IsValidBucketPolicy() {
+	policyType := miniogopolicy.BucketPolicy(args.Policy)
+	if !policyType.IsValidBucketPolicy() {
 		return &json2.Error{
 			Message: "Invalid policy type " + args.Policy,
 		}
 	}
 
-	var policyInfo, err = getBucketAccessPolicy(objectAPI, args.BucketName)
+	ctx := context.Background()
+
+	bucketPolicy, err := objectAPI.GetBucketPolicy(ctx, args.BucketName)
 	if err != nil {
-		if _, ok := errors.Cause(err).(PolicyNotFound); !ok {
+		if _, ok := err.(BucketPolicyNotFound); !ok {
 			return toJSONError(err, args.BucketName)
 		}
-		policyInfo = policy.BucketAccessPolicy{Version: "2012-10-17"}
 	}
 
-	policyInfo.Statements = policy.SetPolicy(policyInfo.Statements, bucketP, args.BucketName, args.Prefix)
-	switch g := objectAPI.(type) {
-	case GatewayLayer:
-		if len(policyInfo.Statements) == 0 {
-			err = g.DeleteBucketPolicies(args.BucketName)
-			if err != nil {
-				return toJSONError(err, args.BucketName)
-			}
-			return nil
-		}
-		err = g.SetBucketPolicies(args.BucketName, policyInfo)
-		if err != nil {
-			return toJSONError(err)
-		}
-		return nil
+	policyInfo, err := PolicyToBucketAccessPolicy(bucketPolicy)
+	if err != nil {
+		// This should not happen.
+		return toJSONError(err, args.BucketName)
 	}
+
+	policyInfo.Statements = miniogopolicy.SetPolicy(policyInfo.Statements, policyType, args.BucketName, args.Prefix)
 
 	if len(policyInfo.Statements) == 0 {
-		if err = persistAndNotifyBucketPolicyChange(args.BucketName, policyChange{
-			true, policy.BucketAccessPolicy{},
-		}, objectAPI); err != nil {
+		if err = objectAPI.DeleteBucketPolicy(ctx, args.BucketName); err != nil {
 			return toJSONError(err, args.BucketName)
 		}
+
+		globalPolicySys.Remove(args.BucketName)
 		return nil
 	}
 
-	data, err := json.Marshal(policyInfo)
+	bucketPolicy, err = BucketAccessPolicyToPolicy(policyInfo)
 	if err != nil {
-		return toJSONError(err)
+		// This should not happen.
+		return toJSONError(err, args.BucketName)
 	}
 
 	// Parse validate and save bucket policy.
-	if s3Error := parseAndPersistBucketPolicy(args.BucketName, data, objectAPI); s3Error != ErrNone {
-		apiErr := getAPIError(s3Error)
-		var err error
-		if apiErr.Code == "XMinioPolicyNesting" {
-			err = PolicyNesting{}
-		} else {
-			err = fmt.Errorf(apiErr.Description)
-		}
+	if err := objectAPI.SetBucketPolicy(ctx, args.BucketName, bucketPolicy); err != nil {
 		return toJSONError(err, args.BucketName)
 	}
+
+	globalPolicySys.Set(args.BucketName, *bucketPolicy)
+	globalNotificationSys.SetBucketPolicy(ctx, args.BucketName, bucketPolicy)
+
 	return nil
 }
 
@@ -968,26 +1034,27 @@ func presignedGet(host, bucket, object string, expiry int64) string {
 	if expiry < 604800 && expiry > 0 {
 		expiryStr = strconv.FormatInt(expiry, 10)
 	}
-	query := strings.Join([]string{
-		"X-Amz-Algorithm=" + signV4Algorithm,
-		"X-Amz-Credential=" + strings.Replace(credential, "/", "%2F", -1),
-		"X-Amz-Date=" + dateStr,
-		"X-Amz-Expires=" + expiryStr,
-		"X-Amz-SignedHeaders=host",
-	}, "&")
+
+	query := url.Values{}
+	query.Set("X-Amz-Algorithm", signV4Algorithm)
+	query.Set("X-Amz-Credential", credential)
+	query.Set("X-Amz-Date", dateStr)
+	query.Set("X-Amz-Expires", expiryStr)
+	query.Set("X-Amz-SignedHeaders", "host")
+	queryStr := s3utils.QueryEncode(query)
 
 	path := "/" + path.Join(bucket, object)
 
 	// "host" is the only header required to be signed for Presigned URLs.
 	extractedSignedHeaders := make(http.Header)
 	extractedSignedHeaders.Set("host", host)
-	canonicalRequest := getCanonicalRequest(extractedSignedHeaders, unsignedPayload, query, path, "GET")
+	canonicalRequest := getCanonicalRequest(extractedSignedHeaders, unsignedPayload, queryStr, path, "GET")
 	stringToSign := getStringToSign(canonicalRequest, date, getScope(date, region))
 	signingKey := getSigningKey(secretKey, date, region)
 	signature := getSignature(signingKey, stringToSign)
 
 	// Construct the final presigned URL.
-	return host + getURLEncodedName(path) + "?" + query + "&" + "X-Amz-Signature=" + signature
+	return host + s3utils.EncodePath(path) + "?" + queryStr + "&" + "X-Amz-Signature=" + signature
 }
 
 // toJSONError converts regular errors into more user friendly
@@ -1033,7 +1100,6 @@ func toJSONError(err error, params ...string) (jerr *json2.Error) {
 
 // toWebAPIError - convert into error into APIError.
 func toWebAPIError(err error) APIError {
-	err = errors.Cause(err)
 	if err == errAuthentication {
 		return APIError{
 			Code:           "AccessDenied",
@@ -1088,7 +1154,10 @@ func toWebAPIError(err error) APIError {
 			HTTPStatusCode: http.StatusBadRequest,
 			Description:    err.Error(),
 		}
+	} else if err == errMethodNotAllowed {
+		return getAPIError(ErrMethodNotAllowed)
 	}
+
 	// Convert error type to api error code.
 	switch err.(type) {
 	case StorageFull:
@@ -1124,7 +1193,7 @@ func toWebAPIError(err error) APIError {
 	}
 
 	// Log unexpected and unhandled errors.
-	errorIf(err, errUnexpected.Error())
+	logger.LogIf(context.Background(), err)
 	return APIError{
 		Code:           "InternalError",
 		HTTPStatusCode: http.StatusInternalServerError,

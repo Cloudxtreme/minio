@@ -18,16 +18,14 @@
 package madmin
 
 import (
-	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/url"
-)
 
-const (
-	configQueryParam = "config"
+	"github.com/minio/minio/pkg/quick"
 )
 
 // NodeSummary - represents the result of an operation part of
@@ -47,20 +45,14 @@ type SetConfigResult struct {
 
 // GetConfig - returns the config.json of a minio setup.
 func (adm *AdminClient) GetConfig() ([]byte, error) {
-	queryVal := make(url.Values)
-	queryVal.Set(configQueryParam, "")
-
-	hdrs := make(http.Header)
-	hdrs.Set(minioAdminOpHeader, "get")
-
-	reqData := requestData{
-		queryValues:   queryVal,
-		customHeaders: hdrs,
+	// No TLS?
+	if !adm.secure {
+		return nil, fmt.Errorf("credentials/configuration cannot be retrieved over an insecure connection")
 	}
 
-	// Execute GET on /?config to get config of a setup.
-	resp, err := adm.executeMethod("GET", reqData)
-
+	// Execute GET on /minio/admin/v1/config to get config of a setup.
+	resp, err := adm.executeMethod("GET",
+		requestData{relPath: "/v1/config"})
 	defer closeResponse(resp)
 	if err != nil {
 		return nil, err
@@ -70,55 +62,70 @@ func (adm *AdminClient) GetConfig() ([]byte, error) {
 		return nil, httpRespToErrorResponse(resp)
 	}
 
-	// Return the JSON marshalled bytes to user.
+	// Return the JSON marshaled bytes to user.
 	return ioutil.ReadAll(resp.Body)
 }
 
 // SetConfig - set config supplied as config.json for the setup.
-func (adm *AdminClient) SetConfig(config io.Reader) (SetConfigResult, error) {
-	queryVal := url.Values{}
-	queryVal.Set(configQueryParam, "")
+func (adm *AdminClient) SetConfig(config io.Reader) (r SetConfigResult, err error) {
+	const maxConfigJSONSize = 256 * 1024 // 256KiB
 
-	// Set x-minio-operation to set.
-	hdrs := make(http.Header)
-	hdrs.Set(minioAdminOpHeader, "set")
+	if !adm.secure { // No TLS?
+		return r, fmt.Errorf("credentials/configuration cannot be updated over an insecure connection")
+	}
 
-	// Read config bytes to calculate MD5, SHA256 and content length.
-	configBytes, err := ioutil.ReadAll(config)
-	if err != nil {
-		return SetConfigResult{}, err
+	// Read configuration bytes
+	configBuf := make([]byte, maxConfigJSONSize+1)
+	n, err := io.ReadFull(config, configBuf)
+	if err == nil {
+		return r, fmt.Errorf("too large file")
+	}
+	if err != io.ErrUnexpectedEOF {
+		return r, err
+	}
+	configBytes := configBuf[:n]
+
+	type configVersion struct {
+		Version string `json:"version,omitempty"`
+	}
+	var cfg configVersion
+
+	// Check if read data is in json format
+	if err = json.Unmarshal(configBytes, &cfg); err != nil {
+		return r, errors.New("Invalid JSON format: " + err.Error())
+	}
+
+	// Check if the provided json file has "version" key set
+	if cfg.Version == "" {
+		return r, errors.New("Missing or unset \"version\" key in json file")
+	}
+	// Validate there are no duplicate keys in the JSON
+	if err = quick.CheckDuplicateKeys(string(configBytes)); err != nil {
+		return r, errors.New("Duplicate key in json file: " + err.Error())
 	}
 
 	reqData := requestData{
-		queryValues:        queryVal,
-		customHeaders:      hdrs,
-		contentBody:        bytes.NewReader(configBytes),
-		contentMD5Bytes:    sumMD5(configBytes),
-		contentSHA256Bytes: sum256(configBytes),
+		relPath: "/v1/config",
+		content: configBytes,
 	}
 
-	// Execute PUT on /?config to set config.
+	// Execute PUT on /minio/admin/v1/config to set config.
 	resp, err := adm.executeMethod("PUT", reqData)
 
 	defer closeResponse(resp)
 	if err != nil {
-		return SetConfigResult{}, err
+		return r, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return SetConfigResult{}, httpRespToErrorResponse(resp)
+		return r, httpRespToErrorResponse(resp)
 	}
 
-	var result SetConfigResult
 	jsonBytes, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return SetConfigResult{}, err
+		return r, err
 	}
 
-	err = json.Unmarshal(jsonBytes, &result)
-	if err != nil {
-		return SetConfigResult{}, err
-	}
-
-	return result, nil
+	err = json.Unmarshal(jsonBytes, &r)
+	return r, err
 }

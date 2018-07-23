@@ -18,11 +18,11 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,14 +33,35 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/handlers"
+
 	humanize "github.com/dustin/go-humanize"
+	"github.com/gorilla/mux"
 	"github.com/pkg/profile"
 )
+
+// IsErrIgnored returns whether given error is ignored or not.
+func IsErrIgnored(err error, ignoredErrs ...error) bool {
+	return IsErr(err, ignoredErrs...)
+}
+
+// IsErr returns whether given error is exact error.
+func IsErr(err error, errs ...error) bool {
+	for _, exactErr := range errs {
+		if err == exactErr {
+			return true
+		}
+	}
+	return false
+}
 
 // Close Http tracing file.
 func stopHTTPTrace() {
 	if globalHTTPTraceFile != nil {
-		errorIf(globalHTTPTraceFile.Close(), "Unable to close httpTraceFile %s", globalHTTPTraceFile.Name())
+		reqInfo := (&logger.ReqInfo{}).AppendTags("traceFile", globalHTTPTraceFile.Name())
+		ctx := logger.SetReqInfo(context.Background(), reqInfo)
+		logger.LogIf(ctx, globalHTTPTraceFile.Close())
 		globalHTTPTraceFile = nil
 	}
 }
@@ -58,14 +79,9 @@ func cloneHeader(h http.Header) http.Header {
 }
 
 // Convert url path into bucket and object name.
-func urlPath2BucketObjectName(u *url.URL) (bucketName, objectName string) {
-	if u == nil {
-		// Empty url, return bucket and object names.
-		return
-	}
-
+func urlPath2BucketObjectName(path string) (bucketName, objectName string) {
 	// Trim any preceding slash separator.
-	urlPath := strings.TrimPrefix(u.Path, slashSeparator)
+	urlPath := strings.TrimPrefix(path, slashSeparator)
 
 	// Split urlpath using slash separator into a given number of
 	// expected tokens.
@@ -98,8 +114,15 @@ func xmlDecoder(body io.Reader, v interface{}, size int64) error {
 }
 
 // checkValidMD5 - verify if valid md5, returns md5 in bytes.
-func checkValidMD5(md5 string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(strings.TrimSpace(md5))
+func checkValidMD5(h http.Header) ([]byte, error) {
+	md5B64, ok := h["Content-Md5"]
+	if ok {
+		if md5B64[0] == "" {
+			return nil, fmt.Errorf("Content-Md5 header set to empty value")
+		}
+		return base64.StdEncoding.DecodeString(md5B64[0])
+	}
+	return []byte{}, nil
 }
 
 /// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
@@ -119,6 +142,10 @@ const (
 	// Maximum Part ID for multipart upload is 10000
 	// (Acceptable values range from 1 to 10000 inclusive)
 	globalMaxPartID = 10000
+
+	// Default values used while communicating with the cloud backends
+	defaultDialTimeout   = 30 * time.Second
+	defaultDialKeepAlive = 30 * time.Second
 )
 
 // isMaxObjectSize - verify if max object size
@@ -209,18 +236,6 @@ func isFile(path string) bool {
 	return false
 }
 
-// checkURL - checks if passed address correspond
-func checkURL(urlStr string) (*url.URL, error) {
-	if urlStr == "" {
-		return nil, errors.New("Address cannot be empty")
-	}
-	u, err := url.Parse(urlStr)
-	if err != nil {
-		return nil, fmt.Errorf("`%s` invalid: %s", urlStr, err.Error())
-	}
-	return u, nil
-}
-
 // UTCNow - returns current UTC time.
 func UTCNow() time.Time {
 	return time.Now().UTC()
@@ -246,17 +261,18 @@ func ToS3ETag(etag string) string {
 
 // NewCustomHTTPTransport returns a new http configuration
 // used while communicating with the cloud backends.
-// This sets the value for MaxIdleConns from 2 (go default) to
-// 100.
-func NewCustomHTTPTransport() http.RoundTripper {
+// This sets the value for MaxIdleConnsPerHost from 2 (go default)
+// to 100.
+func NewCustomHTTPTransport() *http.Transport {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   defaultDialTimeout,
+			KeepAlive: defaultDialKeepAlive,
 		}).DialContext,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   1024,
+		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       &tls.Config{RootCAs: globalRootCAs},
@@ -265,9 +281,103 @@ func NewCustomHTTPTransport() http.RoundTripper {
 }
 
 // Load the json (typically from disk file).
-func jsonLoadFromSeeker(r io.ReadSeeker, data interface{}) error {
+func jsonLoad(r io.ReadSeeker, data interface{}) error {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	return json.NewDecoder(r).Decode(data)
+}
+
+// Save to disk file in json format.
+func jsonSave(f interface {
+	io.WriteSeeker
+	Truncate(int64) error
+}, data interface{}) error {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	if err = f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// ceilFrac takes a numerator and denominator representing a fraction
+// and returns its ceiling. If denominator is 0, it returns 0 instead
+// of crashing.
+func ceilFrac(numerator, denominator int64) (ceil int64) {
+	if denominator == 0 {
+		// do nothing on invalid input
+		return
+	}
+	// Make denominator positive
+	if denominator < 0 {
+		numerator = -numerator
+		denominator = -denominator
+	}
+	ceil = numerator / denominator
+	if numerator > 0 && numerator%denominator != 0 {
+		ceil++
+	}
+	return
+}
+
+// Returns context with ReqInfo details set in the context.
+func newContext(r *http.Request, w http.ResponseWriter, api string) context.Context {
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+	object := vars["object"]
+	prefix := vars["prefix"]
+
+	if prefix != "" {
+		object = prefix
+	}
+	reqInfo := &logger.ReqInfo{
+		RequestID:  w.Header().Get(responseRequestIDKey),
+		RemoteHost: handlers.GetSourceIP(r),
+		UserAgent:  r.Header.Get("user-agent"),
+		API:        api,
+		BucketName: bucket,
+		ObjectName: object,
+	}
+	return logger.SetReqInfo(context.Background(), reqInfo)
+}
+
+// isNetworkOrHostDown - if there was a network error or if the host is down.
+func isNetworkOrHostDown(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch err.(type) {
+	case *net.DNSError, *net.OpError, net.UnknownNetworkError:
+		return true
+	case *url.Error:
+		// For a URL error, where it replies back "connection closed"
+		if strings.Contains(err.Error(), "Connection closed by foreign host") {
+			return true
+		}
+		return true
+	default:
+		if strings.Contains(err.Error(), "net/http: TLS handshake timeout") {
+			// If error is - tlsHandshakeTimeoutError,.
+			return true
+		} else if strings.Contains(err.Error(), "i/o timeout") {
+			// If error is - tcp timeoutError.
+			return true
+		} else if strings.Contains(err.Error(), "connection timed out") {
+			// If err is a net.Dial timeout.
+			return true
+		} else if strings.Contains(err.Error(), "net/http: HTTP/1.x transport connection broken") {
+			return true
+		}
+	}
+	return false
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ import (
 	"sync"
 
 	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/event/target"
+	"github.com/minio/minio/pkg/quick"
 )
 
 /////////////////// Config V1 ///////////////////
@@ -226,23 +228,23 @@ type configV6 struct {
 // Notifier represents collection of supported notification queues in version
 // 1 without NATS streaming.
 type notifierV1 struct {
-	AMQP          map[string]amqpNotify          `json:"amqp"`
-	NATS          map[string]natsNotifyV1        `json:"nats"`
-	ElasticSearch map[string]elasticSearchNotify `json:"elasticsearch"`
-	Redis         map[string]redisNotify         `json:"redis"`
-	PostgreSQL    map[string]postgreSQLNotify    `json:"postgresql"`
-	Kafka         map[string]kafkaNotify         `json:"kafka"`
+	AMQP          map[string]target.AMQPArgs          `json:"amqp"`
+	NATS          map[string]natsNotifyV1             `json:"nats"`
+	ElasticSearch map[string]target.ElasticsearchArgs `json:"elasticsearch"`
+	Redis         map[string]target.RedisArgs         `json:"redis"`
+	PostgreSQL    map[string]target.PostgreSQLArgs    `json:"postgresql"`
+	Kafka         map[string]target.KafkaArgs         `json:"kafka"`
 }
 
 // Notifier represents collection of supported notification queues in version 2
 // with NATS streaming but without webhook.
 type notifierV2 struct {
-	AMQP          map[string]amqpNotify          `json:"amqp"`
-	NATS          map[string]natsNotify          `json:"nats"`
-	ElasticSearch map[string]elasticSearchNotify `json:"elasticsearch"`
-	Redis         map[string]redisNotify         `json:"redis"`
-	PostgreSQL    map[string]postgreSQLNotify    `json:"postgresql"`
-	Kafka         map[string]kafkaNotify         `json:"kafka"`
+	AMQP          map[string]target.AMQPArgs          `json:"amqp"`
+	NATS          map[string]target.NATSArgs          `json:"nats"`
+	ElasticSearch map[string]target.ElasticsearchArgs `json:"elasticsearch"`
+	Redis         map[string]target.RedisArgs         `json:"redis"`
+	PostgreSQL    map[string]target.PostgreSQLArgs    `json:"postgresql"`
+	Kafka         map[string]target.KafkaArgs         `json:"kafka"`
 }
 
 // configV7 server configuration version '7'.
@@ -368,6 +370,18 @@ type serverConfigV12 struct {
 	Notify notifierV2 `json:"notify"`
 }
 
+type notifier struct {
+	AMQP          map[string]target.AMQPArgs          `json:"amqp"`
+	Elasticsearch map[string]target.ElasticsearchArgs `json:"elasticsearch"`
+	Kafka         map[string]target.KafkaArgs         `json:"kafka"`
+	MQTT          map[string]target.MQTTArgs          `json:"mqtt"`
+	MySQL         map[string]target.MySQLArgs         `json:"mysql"`
+	NATS          map[string]target.NATSArgs          `json:"nats"`
+	PostgreSQL    map[string]target.PostgreSQLArgs    `json:"postgresql"`
+	Redis         map[string]target.RedisArgs         `json:"redis"`
+	Webhook       map[string]target.WebhookArgs       `json:"webhook"`
+}
+
 // serverConfigV13 server configuration version '13' which is like
 // version '12' except it adds support for webhook notification.
 type serverConfigV13 struct {
@@ -392,7 +406,7 @@ type serverConfigV14 struct {
 	// S3 API configuration.
 	Credential auth.Credentials `json:"credential"`
 	Region     string           `json:"region"`
-	Browser    BrowserFlag      `json:"browser"`
+	Browser    BoolFlag         `json:"browser"`
 
 	// Additional error logging configuration.
 	Logger *loggerV7 `json:"logger"`
@@ -409,7 +423,7 @@ type serverConfigV15 struct {
 	// S3 API configuration.
 	Credential auth.Credentials `json:"credential"`
 	Region     string           `json:"region"`
-	Browser    BrowserFlag      `json:"browser"`
+	Browser    BoolFlag         `json:"browser"`
 
 	// Additional error logging configuration.
 	Logger *loggerV7 `json:"logger"`
@@ -418,6 +432,21 @@ type serverConfigV15 struct {
 	Notify *notifier `json:"notify"`
 }
 
+// FileLogger is introduced to workaround the dependency about logrus
+type FileLogger struct {
+	Enable   bool   `json:"enable"`
+	Filename string `json:"filename"`
+}
+
+// ConsoleLogger is introduced to workaround the dependency about logrus
+type ConsoleLogger struct {
+	Enable bool `json:"enable"`
+}
+
+// Loggers struct is defined with FileLogger and ConsoleLogger
+// although they are removed from logging logic. They are
+// kept here just to workaround the dependency migration
+// code/logic has on them.
 type loggers struct {
 	sync.RWMutex
 	Console ConsoleLogger `json:"console"`
@@ -432,7 +461,7 @@ type serverConfigV16 struct {
 	// S3 API configuration.
 	Credential auth.Credentials `json:"credential"`
 	Region     string           `json:"region"`
-	Browser    BrowserFlag      `json:"browser"`
+	Browser    BoolFlag         `json:"browser"`
 
 	// Additional error logging configuration.
 	Logger *loggers `json:"logger"`
@@ -451,7 +480,7 @@ type serverConfigV17 struct {
 	// S3 API configuration.
 	Credential auth.Credentials `json:"credential"`
 	Region     string           `json:"region"`
-	Browser    BrowserFlag      `json:"browser"`
+	Browser    BoolFlag         `json:"browser"`
 
 	// Additional error logging configuration.
 	Logger *loggers `json:"logger"`
@@ -470,7 +499,7 @@ type serverConfigV18 struct {
 	// S3 API configuration.
 	Credential auth.Credentials `json:"credential"`
 	Region     string           `json:"region"`
-	Browser    BrowserFlag      `json:"browser"`
+	Browser    BoolFlag         `json:"browser"`
 
 	// Additional error logging configuration.
 	Logger *loggers `json:"logger"`
@@ -488,7 +517,7 @@ type serverConfigV19 struct {
 	// S3 API configuration.
 	Credential auth.Credentials `json:"credential"`
 	Region     string           `json:"region"`
-	Browser    BrowserFlag      `json:"browser"`
+	Browser    BoolFlag         `json:"browser"`
 
 	// Additional error logging configuration.
 	Logger *loggers `json:"logger"`
@@ -506,7 +535,7 @@ type serverConfigV20 struct {
 	// S3 API configuration.
 	Credential auth.Credentials `json:"credential"`
 	Region     string           `json:"region"`
-	Browser    BrowserFlag      `json:"browser"`
+	Browser    BoolFlag         `json:"browser"`
 	Domain     string           `json:"domain"`
 
 	// Additional error logging configuration.
@@ -524,7 +553,7 @@ type serverConfigV21 struct {
 	// S3 API configuration.
 	Credential auth.Credentials `json:"credential"`
 	Region     string           `json:"region"`
-	Browser    BrowserFlag      `json:"browser"`
+	Browser    BoolFlag         `json:"browser"`
 	Domain     string           `json:"domain"`
 
 	// Notification queue configuration.
@@ -532,20 +561,164 @@ type serverConfigV21 struct {
 }
 
 // serverConfigV22 is just like version '21' with added support
-// for StorageClass
+// for StorageClass.
+//
+// IMPORTANT NOTE: When updating this struct make sure that
+// serverConfig.ConfigDiff() is updated as necessary.
 type serverConfigV22 struct {
-	sync.RWMutex
 	Version string `json:"version"`
 
 	// S3 API configuration.
 	Credential auth.Credentials `json:"credential"`
 	Region     string           `json:"region"`
-	Browser    BrowserFlag      `json:"browser"`
+	Browser    BoolFlag         `json:"browser"`
 	Domain     string           `json:"domain"`
 
 	// Storage class configuration
 	StorageClass storageClassConfig `json:"storageclass"`
 
 	// Notification queue configuration.
-	Notify *notifier `json:"notify"`
+	Notify notifier `json:"notify"`
+}
+
+// serverConfigV23 is just like version '22' with addition of cache field.
+//
+// IMPORTANT NOTE: When updating this struct make sure that
+// serverConfig.ConfigDiff() is updated as necessary.
+type serverConfigV23 struct {
+	Version string `json:"version"`
+
+	// S3 API configuration.
+	Credential auth.Credentials `json:"credential"`
+	Region     string           `json:"region"`
+	Browser    BoolFlag         `json:"browser"`
+	Domain     string           `json:"domain"`
+
+	// Storage class configuration
+	StorageClass storageClassConfig `json:"storageclass"`
+
+	// Cache configuration
+	Cache CacheConfig `json:"cache"`
+
+	// Notification queue configuration.
+	Notify notifier `json:"notify"`
+}
+
+// serverConfigV24 is just like version '23', we had to revert
+// the changes which were made in 6fb06045028b7a57c37c60a612c8e50735279ab4
+//
+// IMPORTANT NOTE: When updating this struct make sure that
+// serverConfig.ConfigDiff() is updated as necessary.
+type serverConfigV24 struct {
+	Version string `json:"version"`
+
+	// S3 API configuration.
+	Credential auth.Credentials `json:"credential"`
+	Region     string           `json:"region"`
+	Browser    BoolFlag         `json:"browser"`
+	Domain     string           `json:"domain"`
+
+	// Storage class configuration
+	StorageClass storageClassConfig `json:"storageclass"`
+
+	// Cache configuration
+	Cache CacheConfig `json:"cache"`
+
+	// Notification queue configuration.
+	Notify notifier `json:"notify"`
+}
+
+// serverConfigV25 is just like version '24', stores additionally
+// worm variable.
+//
+// IMPORTANT NOTE: When updating this struct make sure that
+// serverConfig.ConfigDiff() is updated as necessary.
+type serverConfigV25 struct {
+	quick.Config `json:"-"` // ignore interfaces
+
+	Version string `json:"version"`
+
+	// S3 API configuration.
+	Credential auth.Credentials `json:"credential"`
+	Region     string           `json:"region"`
+	Browser    BoolFlag         `json:"browser"`
+	Worm       BoolFlag         `json:"worm"`
+	Domain     string           `json:"domain"`
+
+	// Storage class configuration
+	StorageClass storageClassConfig `json:"storageclass"`
+
+	// Cache configuration
+	Cache CacheConfig `json:"cache"`
+
+	// Notification queue configuration.
+	Notify notifier `json:"notify"`
+}
+
+// serverConfigV26 is just like version '25', stores additionally
+// cache max use value in 'CacheConfig'.
+type serverConfigV26 struct {
+	quick.Config `json:"-"` // ignore interfaces
+
+	Version string `json:"version"`
+
+	// S3 API configuration.
+	Credential auth.Credentials `json:"credential"`
+	Region     string           `json:"region"`
+	Browser    BoolFlag         `json:"browser"`
+	Worm       BoolFlag         `json:"worm"`
+	Domain     string           `json:"domain"`
+
+	// Storage class configuration
+	StorageClass storageClassConfig `json:"storageclass"`
+
+	// Cache configuration
+	Cache CacheConfig `json:"cache"`
+
+	// Notification queue configuration.
+	Notify notifier `json:"notify"`
+}
+
+type loggerConsole struct {
+	Enabled bool `json:"enabled"`
+}
+
+type loggerHTTP struct {
+	Enabled  bool   `json:"enabled"`
+	Endpoint string `json:"endpoint"`
+}
+
+type loggerConfig struct {
+	Console loggerConsole         `json:"console"`
+	HTTP    map[string]loggerHTTP `json:"http"`
+}
+
+// serverConfigV27 is just like version '26', stores additionally
+// the logger field
+//
+// IMPORTANT NOTE: When updating this struct make sure that
+// serverConfig.ConfigDiff() is updated as necessary.
+type serverConfigV27 struct {
+	quick.Config `json:"-"` // ignore interfaces
+
+	Version string `json:"version"`
+
+	// S3 API configuration.
+	Credential auth.Credentials `json:"credential"`
+	Region     string           `json:"region"`
+	Browser    BoolFlag         `json:"browser"`
+	Worm       BoolFlag         `json:"worm"`
+	Domain     string           `json:"domain"`
+
+	// Storage class configuration
+	StorageClass storageClassConfig `json:"storageclass"`
+
+	// Cache configuration
+	Cache CacheConfig `json:"cache"`
+
+	// Notification queue configuration.
+	Notify notifier `json:"notify"`
+
+	// Logger configuration
+	Logger loggerConfig `json:"logger"`
 }

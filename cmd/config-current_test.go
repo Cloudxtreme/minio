@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,10 +20,10 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/event/target"
 )
 
 func TestServerConfig(t *testing.T) {
@@ -44,62 +44,13 @@ func TestServerConfig(t *testing.T) {
 		t.Errorf("Expecting region `us-west-1` found %s", globalServerConfig.GetRegion())
 	}
 
-	// Set new amqp notification id.
-	globalServerConfig.Notify.SetAMQPByID("2", amqpNotify{})
-	savedNotifyCfg1 := globalServerConfig.Notify.GetAMQPByID("2")
-	if !reflect.DeepEqual(savedNotifyCfg1, amqpNotify{}) {
-		t.Errorf("Expecting AMQP config %#v found %#v", amqpNotify{}, savedNotifyCfg1)
-	}
-
-	// Set new elastic search notification id.
-	globalServerConfig.Notify.SetElasticSearchByID("2", elasticSearchNotify{})
-	savedNotifyCfg2 := globalServerConfig.Notify.GetElasticSearchByID("2")
-	if !reflect.DeepEqual(savedNotifyCfg2, elasticSearchNotify{}) {
-		t.Errorf("Expecting Elasticsearch config %#v found %#v", elasticSearchNotify{}, savedNotifyCfg2)
-	}
-
-	// Set new redis notification id.
-	globalServerConfig.Notify.SetRedisByID("2", redisNotify{})
-	savedNotifyCfg3 := globalServerConfig.Notify.GetRedisByID("2")
-	if !reflect.DeepEqual(savedNotifyCfg3, redisNotify{}) {
-		t.Errorf("Expecting Redis config %#v found %#v", redisNotify{}, savedNotifyCfg3)
-	}
-
-	// Set new kafka notification id.
-	globalServerConfig.Notify.SetKafkaByID("2", kafkaNotify{})
-	savedNotifyCfg4 := globalServerConfig.Notify.GetKafkaByID("2")
-	if !reflect.DeepEqual(savedNotifyCfg4, kafkaNotify{}) {
-		t.Errorf("Expecting Kafka config %#v found %#v", kafkaNotify{}, savedNotifyCfg4)
-	}
-
-	// Set new Webhook notification id.
-	globalServerConfig.Notify.SetWebhookByID("2", webhookNotify{})
-	savedNotifyCfg5 := globalServerConfig.Notify.GetWebhookByID("2")
-	if !reflect.DeepEqual(savedNotifyCfg5, webhookNotify{}) {
-		t.Errorf("Expecting Webhook config %#v found %#v", webhookNotify{}, savedNotifyCfg5)
-	}
-
-	// Set new MySQL notification id.
-	globalServerConfig.Notify.SetMySQLByID("2", mySQLNotify{})
-	savedNotifyCfg6 := globalServerConfig.Notify.GetMySQLByID("2")
-	if !reflect.DeepEqual(savedNotifyCfg6, mySQLNotify{}) {
-		t.Errorf("Expecting Webhook config %#v found %#v", mySQLNotify{}, savedNotifyCfg6)
-	}
-
-	// Set new MQTT notification id.
-	globalServerConfig.Notify.SetMQTTByID("2", mqttNotify{})
-	savedNotifyCfg7 := globalServerConfig.Notify.GetMQTTByID("2")
-	if !reflect.DeepEqual(savedNotifyCfg7, mqttNotify{}) {
-		t.Errorf("Expecting Webhook config %#v found %#v", mqttNotify{}, savedNotifyCfg7)
-	}
-
 	// Match version.
 	if globalServerConfig.GetVersion() != serverConfigVersion {
 		t.Errorf("Expecting version %s found %s", globalServerConfig.GetVersion(), serverConfigVersion)
 	}
 
 	// Attempt to save.
-	if err := globalServerConfig.Save(); err != nil {
+	if err := globalServerConfig.Save(getConfigFile()); err != nil {
 		t.Fatalf("Unable to save updated config file %s", err)
 	}
 
@@ -172,34 +123,6 @@ func TestServerConfigWithEnvs(t *testing.T) {
 	if globalServerConfig.Domain != "domain.com" {
 		t.Errorf("Expecting Domain to be `domain.com` found " + globalServerConfig.Domain)
 	}
-}
-
-func TestCheckDupJSONKeys(t *testing.T) {
-	testCases := []struct {
-		json       string
-		shouldPass bool
-	}{
-		{`{}`, true},
-		{`{"version" : "13"}`, true},
-		{`{"version" : "13", "version": "14"}`, false},
-		{`{"version" : "13", "credential": {"accessKey": "12345"}}`, true},
-		{`{"version" : "13", "credential": {"accessKey": "12345", "accessKey":"12345"}}`, false},
-		{`{"version" : "13", "notify": {"amqp": {"1"}, "webhook":{"3"}}}`, true},
-		{`{"version" : "13", "notify": {"amqp": {"1"}, "amqp":{"3"}}}`, false},
-		{`{"version" : "13", "notify": {"amqp": {"1":{}, "2":{}}}}`, true},
-		{`{"version" : "13", "notify": {"amqp": {"1":{}, "1":{}}}}`, false},
-	}
-
-	for i, testCase := range testCases {
-		err := doCheckDupJSONKeys(gjson.Result{}, gjson.Parse(testCase.json))
-		if testCase.shouldPass && err != nil {
-			t.Errorf("Test %d, should pass but it failed with err = %v", i+1, err)
-		}
-		if !testCase.shouldPass && err == nil {
-			t.Errorf("Test %d, should fail but it succeed.", i+1)
-		}
-	}
-
 }
 
 // Tests config validator..
@@ -315,4 +238,105 @@ func TestValidateConfig(t *testing.T) {
 		}
 	}
 
+}
+
+func TestConfigDiff(t *testing.T) {
+	testCases := []struct {
+		s, t *serverConfig
+		diff string
+	}{
+		// 1
+		{&serverConfig{}, nil, "Given configuration is empty"},
+		// 2
+		{
+			&serverConfig{Credential: auth.Credentials{"u1", "p1"}},
+			&serverConfig{Credential: auth.Credentials{"u1", "p2"}},
+			"Credential configuration differs",
+		},
+		// 3
+		{&serverConfig{Region: "us-east-1"}, &serverConfig{Region: "us-west-1"}, "Region configuration differs"},
+		// 4
+		{&serverConfig{Browser: false}, &serverConfig{Browser: true}, "Browser configuration differs"},
+		// 5
+		{&serverConfig{Domain: "domain1"}, &serverConfig{Domain: "domain2"}, "Domain configuration differs"},
+		// 6
+		{
+			&serverConfig{StorageClass: storageClassConfig{storageClass{"1", 8}, storageClass{"2", 6}}},
+			&serverConfig{StorageClass: storageClassConfig{storageClass{"1", 8}, storageClass{"2", 4}}},
+			"StorageClass configuration differs",
+		},
+		// 7
+		{
+			&serverConfig{Notify: notifier{AMQP: map[string]target.AMQPArgs{"1": {Enable: true}}}},
+			&serverConfig{Notify: notifier{AMQP: map[string]target.AMQPArgs{"1": {Enable: false}}}},
+			"AMQP Notification configuration differs",
+		},
+		// 8
+		{
+			&serverConfig{Notify: notifier{NATS: map[string]target.NATSArgs{"1": {Enable: true}}}},
+			&serverConfig{Notify: notifier{NATS: map[string]target.NATSArgs{"1": {Enable: false}}}},
+			"NATS Notification configuration differs",
+		},
+		// 9
+		{
+			&serverConfig{Notify: notifier{Elasticsearch: map[string]target.ElasticsearchArgs{"1": {Enable: true}}}},
+			&serverConfig{Notify: notifier{Elasticsearch: map[string]target.ElasticsearchArgs{"1": {Enable: false}}}},
+			"ElasticSearch Notification configuration differs",
+		},
+		// 10
+		{
+			&serverConfig{Notify: notifier{Redis: map[string]target.RedisArgs{"1": {Enable: true}}}},
+			&serverConfig{Notify: notifier{Redis: map[string]target.RedisArgs{"1": {Enable: false}}}},
+			"Redis Notification configuration differs",
+		},
+		// 11
+		{
+			&serverConfig{Notify: notifier{PostgreSQL: map[string]target.PostgreSQLArgs{"1": {Enable: true}}}},
+			&serverConfig{Notify: notifier{PostgreSQL: map[string]target.PostgreSQLArgs{"1": {Enable: false}}}},
+			"PostgreSQL Notification configuration differs",
+		},
+		// 12
+		{
+			&serverConfig{Notify: notifier{Kafka: map[string]target.KafkaArgs{"1": {Enable: true}}}},
+			&serverConfig{Notify: notifier{Kafka: map[string]target.KafkaArgs{"1": {Enable: false}}}},
+			"Kafka Notification configuration differs",
+		},
+		// 13
+		{
+			&serverConfig{Notify: notifier{Webhook: map[string]target.WebhookArgs{"1": {Enable: true}}}},
+			&serverConfig{Notify: notifier{Webhook: map[string]target.WebhookArgs{"1": {Enable: false}}}},
+			"Webhook Notification configuration differs",
+		},
+		// 14
+		{
+			&serverConfig{Notify: notifier{MySQL: map[string]target.MySQLArgs{"1": {Enable: true}}}},
+			&serverConfig{Notify: notifier{MySQL: map[string]target.MySQLArgs{"1": {Enable: false}}}},
+			"MySQL Notification configuration differs",
+		},
+		// 15
+		{
+			&serverConfig{Notify: notifier{MQTT: map[string]target.MQTTArgs{"1": {Enable: true}}}},
+			&serverConfig{Notify: notifier{MQTT: map[string]target.MQTTArgs{"1": {Enable: false}}}},
+			"MQTT Notification configuration differs",
+		},
+		// 16
+		{
+			&serverConfig{Logger: loggerConfig{
+				Console: loggerConsole{Enabled: true},
+				HTTP:    map[string]loggerHTTP{"1": {Endpoint: "http://address1"}},
+			}},
+			&serverConfig{Logger: loggerConfig{
+				Console: loggerConsole{Enabled: true},
+				HTTP:    map[string]loggerHTTP{"1": {Endpoint: "http://address2"}},
+			}},
+			"Logger configuration differs",
+		},
+	}
+
+	for i, testCase := range testCases {
+		got := testCase.s.ConfigDiff(testCase.t)
+		if got != testCase.diff {
+			t.Errorf("Test %d: got %s expected %s", i+1, got, testCase.diff)
+		}
+	}
 }

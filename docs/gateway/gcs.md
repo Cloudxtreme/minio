@@ -32,7 +32,7 @@ minio gateway gcs yourprojectid
 ```
 
 ## Test using Minio Browser
-Minio Gateway comes with an embedded web based object browser. Point your web browser to http://127.0.0.1:9000 ensure your server has started successfully.
+Minio Gateway comes with an embedded web based object browser. Point your web browser to http://127.0.0.1:9000 to ensure that your server has started successfully.
 
 ![Screenshot](https://github.com/minio/minio/blob/master/docs/screenshots/minio-browser-gateway.png?raw=true)
 
@@ -53,10 +53,8 @@ mc ls mygcs
 ```
 
 ### Known limitations
-
 Gateway inherits the following GCS limitations:
 
-- Maximum number of multipart parts per upload is 1024.
 - Only read-only or write-only bucket policy supported at bucket level, all other variations will return API Notimplemented error.
 - _List Multipart Uploads_ and _List Object parts_ always returns empty list. i.e Client will need to remember all the parts that it has uploaded and use it for _Complete Multipart Upload_
 
@@ -67,6 +65,5 @@ Other limitations:
 ## Explore Further
 - [`mc` command-line interface](https://docs.minio.io/docs/minio-client-quickstart-guide)
 - [`aws` command-line interface](https://docs.minio.io/docs/aws-cli-with-minio)
-- [`minfs` filesystem interface](http://docs.minio.io/docs/minfs-quickstart-guide)
 - [`minio-go` Go SDK](https://docs.minio.io/docs/golang-client-quickstart-guide)
 

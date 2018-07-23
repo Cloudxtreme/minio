@@ -8,8 +8,7 @@ Events occurring on objects in a bucket can be monitored using bucket event noti
 | `s3:ObjectCreated:Post`    | `s3:ObjectRemoved:Delete`                  |
 | `s3:ObjectCreated:Copy`    | `s3:ObjectAccessed:Get`                    |
 
-Use client tools like `mc` to set and listen for event notifications using the [`event` sub-command](https://docs.minio.io/docs/minio-client-complete-guide#events). Minio SDK's
-[`BucketNotification` APIs](https://docs.minio.io/docs/golang-client-api-reference#SetBucketNotification) can also be used.
+Use client tools like `mc` to set and listen for event notifications using the [`event` sub-command](https://docs.minio.io/docs/minio-client-complete-guide#events). Minio SDK's [`BucketNotification` APIs](https://docs.minio.io/docs/golang-client-api-reference#SetBucketNotification) can also be used. The notification message Minio sends to publish an event is a JSON message with the following [structure](https://docs.aws.amazon.com/AmazonS3/latest/dev/notification-content-structure.html).
 
 Bucket events can be published to the following targets:
 
@@ -21,7 +20,7 @@ Bucket events can be published to the following targets:
 
 ## Prerequisites
 
-* Install and configure Minio Server from [here](http://docs.minio.io/docs/minio-quickstart-guide).
+* Install and configure Minio Server from [here](https://docs.minio.io/docs/minio-quickstart-guide).
 * Install and configure Minio Client from [here](https://docs.minio.io/docs/minio-client-quickstart-guide).
 
 <a name="AMQP"></a>
@@ -100,7 +99,7 @@ connection = pika.BlockingConnection(pika.ConnectionParameters(
 channel = connection.channel()
 
 channel.exchange_declare(exchange='bucketevents',
-                         type='fanout')
+                         exchange_type='fanout')
 
 result = channel.queue_declare(exclusive=False)
 queue_name = result.method.queue
@@ -136,7 +135,7 @@ You should receive the following event notification via RabbitMQ once the upload
 
 ```py
 python rabbit.py
-‘{“Records”:[{“eventVersion”:”2.0",”eventSource”:”aws:s3",”awsRegion”:”",”eventTime”:”2016–09–08T22:34:38.226Z”,”eventName”:”s3:ObjectCreated:Put”,”userIdentity”:{“principalId”:”minio”},”requestParameters”:{“sourceIPAddress”:”10.1.10.150:44576"},”responseElements”:{},”s3":{“s3SchemaVersion”:”1.0",”configurationId”:”Config”,”bucket”:{“name”:”images”,”ownerIdentity”:{“principalId”:”minio”},”arn”:”arn:aws:s3:::images”},”object”:{“key”:”myphoto.jpg”,”size”:200436,”sequencer”:”147279EAF9F40933"}}}],”level”:”info”,”msg”:””,”time”:”2016–09–08T15:34:38–07:00"}\n
+'{"Records":[{"eventVersion":"2.0","eventSource":"aws:s3","awsRegion":"","eventTime":"2016–09–08T22:34:38.226Z","eventName":"s3:ObjectCreated:Put","userIdentity":{"principalId":"minio"},"requestParameters":{"sourceIPAddress":"10.1.10.150:44576"},"responseElements":{},"s3":{"s3SchemaVersion":"1.0","configurationId":"Config","bucket":{"name":"images","ownerIdentity":{"principalId":"minio"},"arn":"arn:aws:s3:::images"},"object":{"key":"myphoto.jpg","size":200436,"sequencer":"147279EAF9F40933"}}}],"level":"info","msg":"","time":"2016–09–08T15:34:38–07:00"}'
 ```
 
 <a name="MQTT"></a>
@@ -198,32 +197,25 @@ arn:minio:sqs::1:amqp s3:ObjectCreated:*,s3:ObjectRemoved:* Filter: suffix=”.j
 The python program below waits on mqtt topic ``/minio`` and prints event notifications on the console. We use [paho-mqtt](https://pypi.python.org/pypi/paho-mqtt/) library to do this.
 
 ```py
-#!/usr/bin/env python
+#!/usr/bin/env python3
 from __future__ import print_function
 import paho.mqtt.client as mqtt
 
-# The callback for when the client receives a CONNACK response from the server.
+# This is the Subscriber
+
 def on_connect(client, userdata, flags, rc):
-    print("Connected with result code", rc)
+  print("Connected with result code "+str(rc))
+  client.subscribe("minio")
 
-    # Subscribing in on_connect() means that if we lose the connection and
-    # reconnect then subscriptions will be renewed.
-    client.subscribe("/minio")
-
-# The callback for when a PUBLISH message is received from the server.
 def on_message(client, userdata, msg):
     print(msg.payload)
 
 client = mqtt.Client()
+
 client.on_connect = on_connect
 client.on_message = on_message
 
-client.connect("localhost:1883", 1883, 60)
-
-# Blocking call that processes network traffic, dispatches callbacks and
-# handles reconnecting.
-# Other loop*() functions are available that give a threaded interface and a
-# manual interface.
+client.connect("localhost",1883,60)
 client.loop_forever()
 ```
 

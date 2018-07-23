@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,16 +33,17 @@ import (
 	"cloud.google.com/go/storage"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/cli"
-	"github.com/minio/minio-go/pkg/policy"
+	miniogopolicy "github.com/minio/minio-go/pkg/policy"
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
-	"github.com/minio/minio/pkg/errors"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/policy"
+	"github.com/minio/minio/pkg/policy/condition"
 
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
-	miniogo "github.com/minio/minio-go"
 	minio "github.com/minio/minio/cmd"
 )
 
@@ -110,20 +111,35 @@ ENVIRONMENT VARIABLES:
   BROWSER:
      MINIO_BROWSER: To disable web browser access, set this value to "off".
 
-  UPDATE:
-     MINIO_UPDATE: To turn off in-place upgrades, set this value to "off".
+  DOMAIN:
+     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
+
+  CACHE:
+     MINIO_CACHE_DRIVES: List of mounted drives or directories delimited by ";".
+     MINIO_CACHE_EXCLUDE: List of cache exclusion patterns delimited by ";".
+     MINIO_CACHE_EXPIRY: Cache expiry duration in days.
+     MINIO_CACHE_MAXUSE: Maximum permitted usage of the cache in percentage (0-100).
 
   GCS credentials file:
      GOOGLE_APPLICATION_CREDENTIALS: Path to credentials.json
 
 EXAMPLES:
   1. Start minio gateway server for GCS backend.
-      $ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
-      (Instructions to generate credentials : https://developers.google.com/identity/protocols/application-default-credentials)
-      $ export MINIO_ACCESS_KEY=accesskey
-      $ export MINIO_SECRET_KEY=secretkey
-      $ {{.HelpName}} mygcsprojectid
+     $ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+     (Instructions to generate credentials : https://developers.google.com/identity/protocols/application-default-credentials)
+     $ export MINIO_ACCESS_KEY=accesskey
+     $ export MINIO_SECRET_KEY=secretkey
+     $ {{.HelpName}} mygcsprojectid
 
+  2. Start minio gateway server for GCS backend with edge caching enabled.
+     $ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+     $ export MINIO_ACCESS_KEY=accesskey
+     $ export MINIO_SECRET_KEY=secretkey
+     $ export MINIO_CACHE_DRIVES="/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
+     $ export MINIO_CACHE_EXCLUDE="bucket1/*;*.png"
+     $ export MINIO_CACHE_EXPIRY=40
+     $ export MINIO_CACHE_MAXUSE=80
+     $ {{.HelpName}} mygcsprojectid
 `
 
 	minio.RegisterGatewayCommand(cli.Command{
@@ -139,11 +155,13 @@ EXAMPLES:
 func gcsGatewayMain(ctx *cli.Context) {
 	projectID := ctx.Args().First()
 	if projectID == "" && os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" {
-		minio.ErrorIf(errGCSProjectIDNotFound, "project-id should be provided as argument or GOOGLE_APPLICATION_CREDENTIALS should be set with path to credentials.json")
+		logger.LogIf(context.Background(), errGCSProjectIDNotFound)
 		cli.ShowCommandHelpAndExit(ctx, "gcs", 1)
 	}
 	if projectID != "" && !isValidGCSProjectIDFormat(projectID) {
-		minio.ErrorIf(errGCSInvalidProjectID, "Unable to start GCS gateway with %s", ctx.Args().First())
+		reqInfo := (&logger.ReqInfo{}).AppendTags("projectID", ctx.Args().First())
+		contxt := logger.SetReqInfo(context.Background(), reqInfo)
+		logger.LogIf(contxt, errGCSInvalidProjectID)
 		cli.ShowCommandHelpAndExit(ctx, "gcs", 1)
 	}
 
@@ -155,13 +173,13 @@ type GCS struct {
 	projectID string
 }
 
-// Name returns the name of gcs gatewaylayer.
+// Name returns the name of gcs ObjectLayer.
 func (g *GCS) Name() string {
 	return gcsBackend
 }
 
-// NewGatewayLayer returns gcs gatewaylayer.
-func (g *GCS) NewGatewayLayer(creds auth.Credentials) (minio.GatewayLayer, error) {
+// NewGatewayLayer returns gcs ObjectLayer.
+func (g *GCS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
 	ctx := context.Background()
 
 	var err error
@@ -182,18 +200,10 @@ func (g *GCS) NewGatewayLayer(creds auth.Credentials) (minio.GatewayLayer, error
 		return nil, err
 	}
 
-	// Initialize a anonymous client with minio core APIs.
-	anonClient, err := miniogo.NewCore(googleStorageEndpoint, "", "", true)
-	if err != nil {
-		return nil, err
-	}
-	anonClient.SetCustomTransport(minio.NewCustomHTTPTransport())
-
 	gcs := &gcsGateway{
-		client:     client,
-		projectID:  g.projectID,
-		ctx:        ctx,
-		anonClient: anonClient,
+		client:    client,
+		projectID: g.projectID,
+		ctx:       ctx,
 	}
 
 	// Start background process to cleanup old files in minio.sys.tmp
@@ -201,9 +211,9 @@ func (g *GCS) NewGatewayLayer(creds auth.Credentials) (minio.GatewayLayer, error
 	return gcs, nil
 }
 
-// Production - FIXME: GCS is not production ready yet.
+// Production - GCS gateway is production ready.
 func (g *GCS) Production() bool {
-	return false
+	return true
 }
 
 // Stored in gcs.json - Contents of this file is not used anywhere. It can be
@@ -230,16 +240,6 @@ func gcsToObjectError(err error, params ...string) error {
 		return nil
 	}
 
-	e, ok := err.(*errors.Error)
-	if !ok {
-		// Code should be fixed if this function is called without doing errors.Trace()
-		// Else handling different situations in this function makes this function complicated.
-		minio.ErrorIf(err, "Expected type *Error")
-		return err
-	}
-
-	err = e.Cause
-
 	bucket := ""
 	object := ""
 	uploadID := ""
@@ -259,8 +259,7 @@ func gcsToObjectError(err error, params ...string) error {
 		err = minio.BucketNotFound{
 			Bucket: bucket,
 		}
-		e.Cause = err
-		return e
+		return err
 	case "storage: object doesn't exist":
 		if uploadID != "" {
 			err = minio.InvalidUploadID{
@@ -272,21 +271,18 @@ func gcsToObjectError(err error, params ...string) error {
 				Object: object,
 			}
 		}
-		e.Cause = err
-		return e
+		return err
 	}
 
 	googleAPIErr, ok := err.(*googleapi.Error)
 	if !ok {
 		// We don't interpret non Minio errors. As minio errors will
 		// have StatusCode to help to convert to object errors.
-		e.Cause = err
-		return e
+		return err
 	}
 
 	if len(googleAPIErr.Errors) == 0 {
-		e.Cause = err
-		return e
+		return err
 	}
 
 	reason := googleAPIErr.Errors[0].Reason
@@ -330,8 +326,7 @@ func gcsToObjectError(err error, params ...string) error {
 		err = fmt.Errorf("Unsupported error reason: %s", reason)
 	}
 
-	e.Cause = err
-	return e
+	return err
 }
 
 // gcsProjectIDRegex defines a valid gcs project id format
@@ -349,13 +344,10 @@ func isValidGCSProjectIDFormat(projectID string) bool {
 // gcsGateway - Implements gateway for Minio and GCS compatible object storage servers.
 type gcsGateway struct {
 	minio.GatewayUnsupported
-	client     *storage.Client
-	anonClient *miniogo.Core
-	projectID  string
-	ctx        context.Context
+	client    *storage.Client
+	projectID string
+	ctx       context.Context
 }
-
-const googleStorageEndpoint = "storage.googleapis.com"
 
 // Returns projectID from the GOOGLE_APPLICATION_CREDENTIALS file.
 func gcsParseProjectID(credsFile string) (projectID string, err error) {
@@ -377,7 +369,9 @@ func (l *gcsGateway) CleanupGCSMinioSysTmpBucket(bucket string) {
 		attrs, err := it.Next()
 		if err != nil {
 			if err != iterator.Done {
-				minio.ErrorIf(err, "Object listing error on bucket %s during purging of old files in minio.sys.tmp", bucket)
+				reqInfo := &logger.ReqInfo{BucketName: bucket}
+				ctx := logger.SetReqInfo(context.Background(), reqInfo)
+				logger.LogIf(ctx, err)
 			}
 			return
 		}
@@ -385,7 +379,9 @@ func (l *gcsGateway) CleanupGCSMinioSysTmpBucket(bucket string) {
 			// Delete files older than 2 weeks.
 			err := l.client.Bucket(bucket).Object(attrs.Name).Delete(l.ctx)
 			if err != nil {
-				minio.ErrorIf(err, "Unable to delete %s/%s during purging of old files in minio.sys.tmp", bucket, attrs.Name)
+				reqInfo := &logger.ReqInfo{BucketName: bucket, ObjectName: attrs.Name}
+				ctx := logger.SetReqInfo(context.Background(), reqInfo)
+				logger.LogIf(ctx, err)
 				return
 			}
 		}
@@ -400,7 +396,8 @@ func (l *gcsGateway) CleanupGCSMinioSysTmp() {
 			attrs, err := it.Next()
 			if err != nil {
 				if err != iterator.Done {
-					minio.ErrorIf(err, "Bucket listing error during purging of old files in minio.sys.tmp")
+					ctx := logger.SetReqInfo(context.Background(), &logger.ReqInfo{})
+					logger.LogIf(ctx, err)
 				}
 				break
 			}
@@ -413,17 +410,17 @@ func (l *gcsGateway) CleanupGCSMinioSysTmp() {
 
 // Shutdown - save any gateway metadata to disk
 // if necessary and reload upon next restart.
-func (l *gcsGateway) Shutdown() error {
+func (l *gcsGateway) Shutdown(ctx context.Context) error {
 	return nil
 }
 
 // StorageInfo - Not relevant to GCS backend.
-func (l *gcsGateway) StorageInfo() minio.StorageInfo {
+func (l *gcsGateway) StorageInfo(ctx context.Context) minio.StorageInfo {
 	return minio.StorageInfo{}
 }
 
 // MakeBucketWithLocation - Create a new container on GCS backend.
-func (l *gcsGateway) MakeBucketWithLocation(bucket, location string) error {
+func (l *gcsGateway) MakeBucketWithLocation(ctx context.Context, bucket, location string) error {
 	bkt := l.client.Bucket(bucket)
 
 	// we'll default to the us multi-region in case of us-east-1
@@ -434,15 +431,16 @@ func (l *gcsGateway) MakeBucketWithLocation(bucket, location string) error {
 	err := bkt.Create(l.ctx, l.projectID, &storage.BucketAttrs{
 		Location: location,
 	})
-
-	return gcsToObjectError(errors.Trace(err), bucket)
+	logger.LogIf(ctx, err)
+	return gcsToObjectError(err, bucket)
 }
 
 // GetBucketInfo - Get bucket metadata..
-func (l *gcsGateway) GetBucketInfo(bucket string) (minio.BucketInfo, error) {
+func (l *gcsGateway) GetBucketInfo(ctx context.Context, bucket string) (minio.BucketInfo, error) {
 	attrs, err := l.client.Bucket(bucket).Attrs(l.ctx)
 	if err != nil {
-		return minio.BucketInfo{}, gcsToObjectError(errors.Trace(err), bucket)
+		logger.LogIf(ctx, err)
+		return minio.BucketInfo{}, gcsToObjectError(err, bucket)
 	}
 
 	return minio.BucketInfo{
@@ -452,7 +450,7 @@ func (l *gcsGateway) GetBucketInfo(bucket string) (minio.BucketInfo, error) {
 }
 
 // ListBuckets lists all buckets under your project-id on GCS.
-func (l *gcsGateway) ListBuckets() (buckets []minio.BucketInfo, err error) {
+func (l *gcsGateway) ListBuckets(ctx context.Context) (buckets []minio.BucketInfo, err error) {
 	it := l.client.Buckets(l.ctx, l.projectID)
 
 	// Iterate and capture all the buckets.
@@ -463,7 +461,8 @@ func (l *gcsGateway) ListBuckets() (buckets []minio.BucketInfo, err error) {
 		}
 
 		if ierr != nil {
-			return buckets, gcsToObjectError(errors.Trace(ierr))
+			logger.LogIf(ctx, ierr)
+			return buckets, gcsToObjectError(ierr)
 		}
 
 		buckets = append(buckets, minio.BucketInfo{
@@ -476,7 +475,7 @@ func (l *gcsGateway) ListBuckets() (buckets []minio.BucketInfo, err error) {
 }
 
 // DeleteBucket delete a bucket on GCS.
-func (l *gcsGateway) DeleteBucket(bucket string) error {
+func (l *gcsGateway) DeleteBucket(ctx context.Context, bucket string) error {
 	itObject := l.client.Bucket(bucket).Objects(l.ctx, &storage.Query{
 		Delimiter: "/",
 		Versions:  false,
@@ -491,7 +490,8 @@ func (l *gcsGateway) DeleteBucket(bucket string) error {
 			break
 		}
 		if err != nil {
-			return gcsToObjectError(errors.Trace(err))
+			logger.LogIf(ctx, err)
+			return gcsToObjectError(err)
 		}
 		if objAttrs.Prefix == minio.GatewayMinioSysTmp {
 			gcsMinioPathFound = true
@@ -501,7 +501,8 @@ func (l *gcsGateway) DeleteBucket(bucket string) error {
 		break
 	}
 	if nonGCSMinioPathFound {
-		return gcsToObjectError(errors.Trace(minio.BucketNotEmpty{}))
+		logger.LogIf(ctx, minio.BucketNotEmpty{})
+		return gcsToObjectError(minio.BucketNotEmpty{})
 	}
 	if gcsMinioPathFound {
 		// Remove minio.sys.tmp before deleting the bucket.
@@ -512,16 +513,19 @@ func (l *gcsGateway) DeleteBucket(bucket string) error {
 				break
 			}
 			if err != nil {
-				return gcsToObjectError(errors.Trace(err))
+				logger.LogIf(ctx, err)
+				return gcsToObjectError(err)
 			}
 			err = l.client.Bucket(bucket).Object(objAttrs.Name).Delete(l.ctx)
 			if err != nil {
-				return gcsToObjectError(errors.Trace(err))
+				logger.LogIf(ctx, err)
+				return gcsToObjectError(err)
 			}
 		}
 	}
 	err := l.client.Bucket(bucket).Delete(l.ctx)
-	return gcsToObjectError(errors.Trace(err), bucket)
+	logger.LogIf(ctx, err)
+	return gcsToObjectError(err, bucket)
 }
 
 func toGCSPageToken(name string) string {
@@ -549,16 +553,16 @@ func isGCSMarker(marker string) bool {
 }
 
 // ListObjects - lists all blobs in GCS bucket filtered by prefix
-func (l *gcsGateway) ListObjects(bucket string, prefix string, marker string, delimiter string, maxKeys int) (minio.ListObjectsInfo, error) {
+func (l *gcsGateway) ListObjects(ctx context.Context, bucket string, prefix string, marker string, delimiter string, maxKeys int) (minio.ListObjectsInfo, error) {
+	if maxKeys == 0 {
+		return minio.ListObjectsInfo{}, nil
+	}
+
 	it := l.client.Bucket(bucket).Objects(l.ctx, &storage.Query{
 		Delimiter: delimiter,
 		Prefix:    prefix,
 		Versions:  false,
 	})
-
-	isTruncated := false
-	nextMarker := ""
-	prefixes := []string{}
 
 	// To accommodate S3-compatible applications using
 	// ListObjectsV1 to use object keys as markers to control the
@@ -567,153 +571,162 @@ func (l *gcsGateway) ListObjects(bucket string, prefix string, marker string, de
 	// supplied markers.
 	//
 	// - NextMarker in ListObjectsV1 response is constructed by
-	//   prefixing "##minio" to the GCS continuation token,
-	//   e.g, "##minioCgRvYmoz"
+	//   prefixing "{minio}" to the GCS continuation token,
+	//   e.g, "{minio}CgRvYmoz"
 	//
-	// - Application supplied markers are used as-is to list
-	//   object keys that appear after it in the lexicographical order.
+	// - Application supplied markers are transformed to a
+	//   GCS continuation token.
 
 	// If application is using GCS continuation token we should
 	// strip the gcsTokenPrefix we added.
-	gcsMarker := isGCSMarker(marker)
-	if gcsMarker {
-		it.PageInfo().Token = strings.TrimPrefix(marker, gcsTokenPrefix)
+	token := ""
+	if marker != "" {
+		if isGCSMarker(marker) {
+			token = strings.TrimPrefix(marker, gcsTokenPrefix)
+		} else {
+			token = toGCSPageToken(marker)
+		}
 	}
+	nextMarker := ""
 
-	it.PageInfo().MaxSize = maxKeys
+	var prefixes []string
+	var objects []minio.ObjectInfo
+	var nextPageToken string
+	var err error
 
-	objects := []minio.ObjectInfo{}
+	pager := iterator.NewPager(it, maxKeys, token)
 	for {
-		if len(objects) >= maxKeys {
-			// check if there is one next object and
-			// if that one next object is our hidden
-			// metadata folder, then just break
-			// otherwise we've truncated the output
-			attrs, _ := it.Next()
-			if attrs != nil && attrs.Prefix == minio.GatewayMinioSysTmp {
-				break
-			}
-
-			isTruncated = true
-			break
-		}
-
-		attrs, err := it.Next()
-		if err == iterator.Done {
-			break
-		}
+		gcsObjects := make([]*storage.ObjectAttrs, 0)
+		nextPageToken, err = pager.NextPage(&gcsObjects)
 		if err != nil {
-			return minio.ListObjectsInfo{}, gcsToObjectError(errors.Trace(err), bucket, prefix)
+			logger.LogIf(ctx, err)
+			return minio.ListObjectsInfo{}, gcsToObjectError(err, bucket, prefix)
 		}
 
-		nextMarker = toGCSPageToken(attrs.Name)
+		for _, attrs := range gcsObjects {
 
-		if attrs.Prefix == minio.GatewayMinioSysTmp {
-			// We don't return our metadata prefix.
-			continue
-		}
-		if !strings.HasPrefix(prefix, minio.GatewayMinioSysTmp) {
-			// If client lists outside gcsMinioPath then we filter out gcsMinioPath/* entries.
-			// But if the client lists inside gcsMinioPath then we return the entries in gcsMinioPath/
-			// which will be helpful to observe the "directory structure" for debugging purposes.
-			if strings.HasPrefix(attrs.Prefix, minio.GatewayMinioSysTmp) ||
-				strings.HasPrefix(attrs.Name, minio.GatewayMinioSysTmp) {
+			// Due to minio.GatewayMinioSysTmp keys being skipped, the number of objects + prefixes
+			// returned may not total maxKeys. This behavior is compatible with the S3 spec which
+			// allows the response to include less keys than maxKeys.
+			if attrs.Prefix == minio.GatewayMinioSysTmp {
+				// We don't return our metadata prefix.
 				continue
 			}
-		}
-		if attrs.Prefix != "" {
-			prefixes = append(prefixes, attrs.Prefix)
-			continue
-		}
-		if !gcsMarker && attrs.Name <= marker {
-			// if user supplied a marker don't append
-			// objects until we reach marker (and skip it).
-			continue
+			if !strings.HasPrefix(prefix, minio.GatewayMinioSysTmp) {
+				// If client lists outside gcsMinioPath then we filter out gcsMinioPath/* entries.
+				// But if the client lists inside gcsMinioPath then we return the entries in gcsMinioPath/
+				// which will be helpful to observe the "directory structure" for debugging purposes.
+				if strings.HasPrefix(attrs.Prefix, minio.GatewayMinioSysTmp) ||
+					strings.HasPrefix(attrs.Name, minio.GatewayMinioSysTmp) {
+					continue
+				}
+			}
+
+			if attrs.Prefix != "" {
+				prefixes = append(prefixes, attrs.Prefix)
+			} else {
+				objects = append(objects, fromGCSAttrsToObjectInfo(attrs))
+			}
+
+			// The NextMarker property should only be set in the response if a delimiter is used
+			if delimiter != "" {
+				if attrs.Prefix > nextMarker {
+					nextMarker = attrs.Prefix
+				} else if attrs.Name > nextMarker {
+					nextMarker = attrs.Name
+				}
+			}
 		}
 
-		objects = append(objects, minio.ObjectInfo{
-			Name:            attrs.Name,
-			Bucket:          attrs.Bucket,
-			ModTime:         attrs.Updated,
-			Size:            attrs.Size,
-			ETag:            minio.ToS3ETag(fmt.Sprintf("%d", attrs.CRC32C)),
-			UserDefined:     attrs.Metadata,
-			ContentType:     attrs.ContentType,
-			ContentEncoding: attrs.ContentEncoding,
-		})
+		// Exit the loop if at least one item can be returned from
+		// the current page or there are no more pages available
+		if nextPageToken == "" || len(prefixes)+len(objects) > 0 {
+			break
+		}
+	}
+
+	if nextPageToken == "" {
+		nextMarker = ""
+	} else if nextMarker != "" {
+		nextMarker = gcsTokenPrefix + toGCSPageToken(nextMarker)
 	}
 
 	return minio.ListObjectsInfo{
-		IsTruncated: isTruncated,
-		NextMarker:  gcsTokenPrefix + nextMarker,
+		IsTruncated: nextPageToken != "",
+		NextMarker:  nextMarker,
 		Prefixes:    prefixes,
 		Objects:     objects,
 	}, nil
 }
 
 // ListObjectsV2 - lists all blobs in GCS bucket filtered by prefix
-func (l *gcsGateway) ListObjectsV2(bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (minio.ListObjectsV2Info, error) {
+func (l *gcsGateway) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (minio.ListObjectsV2Info, error) {
+	if maxKeys == 0 {
+		return minio.ListObjectsV2Info{ContinuationToken: continuationToken}, nil
+	}
+
 	it := l.client.Bucket(bucket).Objects(l.ctx, &storage.Query{
 		Delimiter: delimiter,
 		Prefix:    prefix,
 		Versions:  false,
 	})
 
-	isTruncated := false
-	it.PageInfo().MaxSize = maxKeys
-
-	if continuationToken != "" {
-		// If client sends continuationToken, set it
-		it.PageInfo().Token = continuationToken
-	} else {
-		// else set the continuationToken to return
-		continuationToken = it.PageInfo().Token
-		if continuationToken != "" {
-			// If GCS SDK sets continuationToken, it means there are more than maxKeys in the current page
-			// and the response will be truncated
-			isTruncated = true
-		}
+	token := continuationToken
+	if token == "" && startAfter != "" {
+		token = toGCSPageToken(startAfter)
 	}
 
 	var prefixes []string
 	var objects []minio.ObjectInfo
+	var nextPageToken string
+	var err error
 
+	pager := iterator.NewPager(it, maxKeys, token)
 	for {
-		attrs, err := it.Next()
-		if err == iterator.Done {
-			break
-		}
-
+		gcsObjects := make([]*storage.ObjectAttrs, 0)
+		nextPageToken, err = pager.NextPage(&gcsObjects)
 		if err != nil {
-			return minio.ListObjectsV2Info{}, gcsToObjectError(errors.Trace(err), bucket, prefix)
+			logger.LogIf(ctx, err)
+			return minio.ListObjectsV2Info{}, gcsToObjectError(err, bucket, prefix)
 		}
 
-		if attrs.Prefix == minio.GatewayMinioSysTmp {
-			// We don't return our metadata prefix.
-			continue
-		}
-		if !strings.HasPrefix(prefix, minio.GatewayMinioSysTmp) {
-			// If client lists outside gcsMinioPath then we filter out gcsMinioPath/* entries.
-			// But if the client lists inside gcsMinioPath then we return the entries in gcsMinioPath/
-			// which will be helpful to observe the "directory structure" for debugging purposes.
-			if strings.HasPrefix(attrs.Prefix, minio.GatewayMinioSysTmp) ||
-				strings.HasPrefix(attrs.Name, minio.GatewayMinioSysTmp) {
+		for _, attrs := range gcsObjects {
+
+			// Due to minio.GatewayMinioSysTmp keys being skipped, the number of objects + prefixes
+			// returned may not total maxKeys. This behavior is compatible with the S3 spec which
+			// allows the response to include less keys than maxKeys.
+			if attrs.Prefix == minio.GatewayMinioSysTmp {
+				// We don't return our metadata prefix.
 				continue
+			}
+			if !strings.HasPrefix(prefix, minio.GatewayMinioSysTmp) {
+				// If client lists outside gcsMinioPath then we filter out gcsMinioPath/* entries.
+				// But if the client lists inside gcsMinioPath then we return the entries in gcsMinioPath/
+				// which will be helpful to observe the "directory structure" for debugging purposes.
+				if strings.HasPrefix(attrs.Prefix, minio.GatewayMinioSysTmp) ||
+					strings.HasPrefix(attrs.Name, minio.GatewayMinioSysTmp) {
+					continue
+				}
+			}
+
+			if attrs.Prefix != "" {
+				prefixes = append(prefixes, attrs.Prefix)
+			} else {
+				objects = append(objects, fromGCSAttrsToObjectInfo(attrs))
 			}
 		}
 
-		if attrs.Prefix != "" {
-			prefixes = append(prefixes, attrs.Prefix)
-			continue
+		// Exit the loop if at least one item can be returned from
+		// the current page or there are no more pages available
+		if nextPageToken == "" || len(prefixes)+len(objects) > 0 {
+			break
 		}
-
-		objects = append(objects, fromGCSAttrsToObjectInfo(attrs))
 	}
 
 	return minio.ListObjectsV2Info{
-		IsTruncated:           isTruncated,
+		IsTruncated:           nextPageToken != "",
 		ContinuationToken:     continuationToken,
-		NextContinuationToken: continuationToken,
+		NextContinuationToken: nextPageToken,
 		Prefixes:              prefixes,
 		Objects:               objects,
 	}, nil
@@ -725,22 +738,25 @@ func (l *gcsGateway) ListObjectsV2(bucket, prefix, continuationToken, delimiter 
 //
 // startOffset indicates the starting read location of the object.
 // length indicates the total length of the object.
-func (l *gcsGateway) GetObject(bucket string, key string, startOffset int64, length int64, writer io.Writer) error {
+func (l *gcsGateway) GetObject(ctx context.Context, bucket string, key string, startOffset int64, length int64, writer io.Writer, etag string) error {
 	// if we want to mimic S3 behavior exactly, we need to verify if bucket exists first,
 	// otherwise gcs will just return object not exist in case of non-existing bucket
 	if _, err := l.client.Bucket(bucket).Attrs(l.ctx); err != nil {
-		return gcsToObjectError(errors.Trace(err), bucket)
+		logger.LogIf(ctx, err)
+		return gcsToObjectError(err, bucket)
 	}
 
 	object := l.client.Bucket(bucket).Object(key)
 	r, err := object.NewRangeReader(l.ctx, startOffset, length)
 	if err != nil {
-		return gcsToObjectError(errors.Trace(err), bucket, key)
+		logger.LogIf(ctx, err)
+		return gcsToObjectError(err, bucket, key)
 	}
 	defer r.Close()
 
 	if _, err := io.Copy(writer, r); err != nil {
-		return gcsToObjectError(errors.Trace(err), bucket, key)
+		logger.LogIf(ctx, err)
+		return gcsToObjectError(err, bucket, key)
 	}
 
 	return nil
@@ -750,54 +766,99 @@ func (l *gcsGateway) GetObject(bucket string, key string, startOffset int64, len
 func fromGCSAttrsToObjectInfo(attrs *storage.ObjectAttrs) minio.ObjectInfo {
 	// All google cloud storage objects have a CRC32c hash, whereas composite objects may not have a MD5 hash
 	// Refer https://cloud.google.com/storage/docs/hashes-etags. Use CRC32C for ETag
+	metadata := make(map[string]string)
+	for k, v := range attrs.Metadata {
+		metadata[k] = v
+	}
+	if attrs.ContentType != "" {
+		metadata["content-type"] = attrs.ContentType
+	}
+	if attrs.ContentEncoding != "" {
+		metadata["content-encoding"] = attrs.ContentEncoding
+	}
+	if attrs.CacheControl != "" {
+		metadata["cache-control"] = attrs.CacheControl
+	}
+	if attrs.ContentDisposition != "" {
+		metadata["content-disposition"] = attrs.ContentDisposition
+	}
+	if attrs.ContentLanguage != "" {
+		metadata["content-language"] = attrs.ContentLanguage
+	}
 	return minio.ObjectInfo{
 		Name:            attrs.Name,
 		Bucket:          attrs.Bucket,
 		ModTime:         attrs.Updated,
 		Size:            attrs.Size,
 		ETag:            minio.ToS3ETag(fmt.Sprintf("%d", attrs.CRC32C)),
-		UserDefined:     attrs.Metadata,
+		UserDefined:     metadata,
 		ContentType:     attrs.ContentType,
 		ContentEncoding: attrs.ContentEncoding,
 	}
 }
 
+// applyMetadataToGCSAttrs applies metadata to a GCS ObjectAttrs instance
+func applyMetadataToGCSAttrs(metadata map[string]string, attrs *storage.ObjectAttrs) {
+	attrs.ContentType = metadata["content-type"]
+	attrs.ContentEncoding = metadata["content-encoding"]
+	attrs.CacheControl = metadata["cache-control"]
+	attrs.ContentDisposition = metadata["content-disposition"]
+	attrs.ContentLanguage = metadata["content-language"]
+
+	attrs.Metadata = make(map[string]string)
+	for k, v := range metadata {
+		attrs.Metadata[k] = v
+	}
+	// Filter metadata which is stored as a unique attribute
+	for _, key := range []string{
+		"content-type", "content-encoding", "cache-control", "content-disposition", "content-language",
+	} {
+		delete(attrs.Metadata, key)
+	}
+}
+
 // GetObjectInfo - reads object info and replies back ObjectInfo
-func (l *gcsGateway) GetObjectInfo(bucket string, object string) (minio.ObjectInfo, error) {
+func (l *gcsGateway) GetObjectInfo(ctx context.Context, bucket string, object string) (minio.ObjectInfo, error) {
 	// if we want to mimic S3 behavior exactly, we need to verify if bucket exists first,
 	// otherwise gcs will just return object not exist in case of non-existing bucket
 	if _, err := l.client.Bucket(bucket).Attrs(l.ctx); err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket)
 	}
 
 	attrs, err := l.client.Bucket(bucket).Object(object).Attrs(l.ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket, object)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket, object)
 	}
 
 	return fromGCSAttrsToObjectInfo(attrs), nil
 }
 
 // PutObject - Create a new object with the incoming data,
-func (l *gcsGateway) PutObject(bucket string, key string, data *hash.Reader, metadata map[string]string) (minio.ObjectInfo, error) {
+func (l *gcsGateway) PutObject(ctx context.Context, bucket string, key string, data *hash.Reader, metadata map[string]string) (minio.ObjectInfo, error) {
 	// if we want to mimic S3 behavior exactly, we need to verify if bucket exists first,
 	// otherwise gcs will just return object not exist in case of non-existing bucket
 	if _, err := l.client.Bucket(bucket).Attrs(l.ctx); err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket)
 	}
 
 	object := l.client.Bucket(bucket).Object(key)
 
 	w := object.NewWriter(l.ctx)
-
-	w.ContentType = metadata["content-type"]
-	w.ContentEncoding = metadata["content-encoding"]
-	w.Metadata = metadata
+	// Disable "chunked" uploading in GCS client if the size of the data to be uploaded is below
+	// the current chunk-size of the writer. This avoids an unnecessary memory allocation.
+	if data.Size() < int64(w.ChunkSize) {
+		w.ChunkSize = 0
+	}
+	applyMetadataToGCSAttrs(metadata, &w.ObjectAttrs)
 
 	if _, err := io.Copy(w, data); err != nil {
 		// Close the object writer upon error.
 		w.CloseWithError(err)
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket, key)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket, key)
 	}
 
 	// Close the object writer upon success.
@@ -805,42 +866,45 @@ func (l *gcsGateway) PutObject(bucket string, key string, data *hash.Reader, met
 
 	attrs, err := object.Attrs(l.ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket, key)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket, key)
 	}
 
 	return fromGCSAttrsToObjectInfo(attrs), nil
 }
 
 // CopyObject - Copies a blob from source container to destination container.
-func (l *gcsGateway) CopyObject(srcBucket string, srcObject string, destBucket string, destObject string,
-	metadata map[string]string) (minio.ObjectInfo, error) {
+func (l *gcsGateway) CopyObject(ctx context.Context, srcBucket string, srcObject string, destBucket string, destObject string,
+	srcInfo minio.ObjectInfo) (minio.ObjectInfo, error) {
 
 	src := l.client.Bucket(srcBucket).Object(srcObject)
 	dst := l.client.Bucket(destBucket).Object(destObject)
 
 	copier := dst.CopierFrom(src)
-	copier.ObjectAttrs.Metadata = metadata
+	applyMetadataToGCSAttrs(srcInfo.UserDefined, &copier.ObjectAttrs)
 
 	attrs, err := copier.Run(l.ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), destBucket, destObject)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, destBucket, destObject)
 	}
 
 	return fromGCSAttrsToObjectInfo(attrs), nil
 }
 
 // DeleteObject - Deletes a blob in bucket
-func (l *gcsGateway) DeleteObject(bucket string, object string) error {
+func (l *gcsGateway) DeleteObject(ctx context.Context, bucket string, object string) error {
 	err := l.client.Bucket(bucket).Object(object).Delete(l.ctx)
 	if err != nil {
-		return gcsToObjectError(errors.Trace(err), bucket, object)
+		logger.LogIf(ctx, err)
+		return gcsToObjectError(err, bucket, object)
 	}
 
 	return nil
 }
 
 // NewMultipartUpload - upload object in multiple parts
-func (l *gcsGateway) NewMultipartUpload(bucket string, key string, metadata map[string]string) (uploadID string, err error) {
+func (l *gcsGateway) NewMultipartUpload(ctx context.Context, bucket string, key string, metadata map[string]string) (uploadID string, err error) {
 	// generate new uploadid
 	uploadID = minio.MustGetUUID()
 
@@ -850,22 +914,21 @@ func (l *gcsGateway) NewMultipartUpload(bucket string, key string, metadata map[
 	w := l.client.Bucket(bucket).Object(meta).NewWriter(l.ctx)
 	defer w.Close()
 
-	w.ContentType = metadata["content-type"]
-	w.ContentEncoding = metadata["content-encoding"]
-	w.Metadata = metadata
+	applyMetadataToGCSAttrs(metadata, &w.ObjectAttrs)
 
 	if err = json.NewEncoder(w).Encode(gcsMultipartMetaV1{
 		gcsMinioMultipartMetaCurrentVersion,
 		bucket,
 		key,
 	}); err != nil {
-		return "", gcsToObjectError(errors.Trace(err), bucket, key)
+		logger.LogIf(ctx, err)
+		return "", gcsToObjectError(err, bucket, key)
 	}
 	return uploadID, nil
 }
 
 // ListMultipartUploads - lists all multipart uploads.
-func (l *gcsGateway) ListMultipartUploads(bucket string, prefix string, keyMarker string, uploadIDMarker string, delimiter string, maxUploads int) (minio.ListMultipartsInfo, error) {
+func (l *gcsGateway) ListMultipartUploads(ctx context.Context, bucket string, prefix string, keyMarker string, uploadIDMarker string, delimiter string, maxUploads int) (minio.ListMultipartsInfo, error) {
 	return minio.ListMultipartsInfo{
 		KeyMarker:      keyMarker,
 		UploadIDMarker: uploadIDMarker,
@@ -877,14 +940,15 @@ func (l *gcsGateway) ListMultipartUploads(bucket string, prefix string, keyMarke
 
 // Checks if minio.sys.tmp/multipart/v1/<upload-id>/gcs.json exists, returns
 // an object layer compatible error upon any error.
-func (l *gcsGateway) checkUploadIDExists(bucket string, key string, uploadID string) error {
+func (l *gcsGateway) checkUploadIDExists(ctx context.Context, bucket string, key string, uploadID string) error {
 	_, err := l.client.Bucket(bucket).Object(gcsMultipartMetaName(uploadID)).Attrs(l.ctx)
-	return gcsToObjectError(errors.Trace(err), bucket, key, uploadID)
+	logger.LogIf(ctx, err)
+	return gcsToObjectError(err, bucket, key, uploadID)
 }
 
 // PutObjectPart puts a part of object in bucket
-func (l *gcsGateway) PutObjectPart(bucket string, key string, uploadID string, partNumber int, data *hash.Reader) (minio.PartInfo, error) {
-	if err := l.checkUploadIDExists(bucket, key, uploadID); err != nil {
+func (l *gcsGateway) PutObjectPart(ctx context.Context, bucket string, key string, uploadID string, partNumber int, data *hash.Reader) (minio.PartInfo, error) {
+	if err := l.checkUploadIDExists(ctx, bucket, key, uploadID); err != nil {
 		return minio.PartInfo{}, err
 	}
 	etag := data.MD5HexString()
@@ -900,7 +964,8 @@ func (l *gcsGateway) PutObjectPart(bucket string, key string, uploadID string, p
 	if _, err := io.Copy(w, data); err != nil {
 		// Make sure to close object writer upon error.
 		w.Close()
-		return minio.PartInfo{}, gcsToObjectError(errors.Trace(err), bucket, key)
+		logger.LogIf(ctx, err)
+		return minio.PartInfo{}, gcsToObjectError(err, bucket, key)
 	}
 	// Make sure to close the object writer upon success.
 	w.Close()
@@ -914,12 +979,12 @@ func (l *gcsGateway) PutObjectPart(bucket string, key string, uploadID string, p
 }
 
 // ListObjectParts returns all object parts for specified object in specified bucket
-func (l *gcsGateway) ListObjectParts(bucket string, key string, uploadID string, partNumberMarker int, maxParts int) (minio.ListPartsInfo, error) {
-	return minio.ListPartsInfo{}, l.checkUploadIDExists(bucket, key, uploadID)
+func (l *gcsGateway) ListObjectParts(ctx context.Context, bucket string, key string, uploadID string, partNumberMarker int, maxParts int) (minio.ListPartsInfo, error) {
+	return minio.ListPartsInfo{}, l.checkUploadIDExists(ctx, bucket, key, uploadID)
 }
 
 // Called by AbortMultipartUpload and CompleteMultipartUpload for cleaning up.
-func (l *gcsGateway) cleanupMultipartUpload(bucket, key, uploadID string) error {
+func (l *gcsGateway) cleanupMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
 	prefix := fmt.Sprintf("%s/%s/", gcsMinioMultipartPathV1, uploadID)
 
 	// iterate through all parts and delete them
@@ -931,7 +996,8 @@ func (l *gcsGateway) cleanupMultipartUpload(bucket, key, uploadID string) error 
 			break
 		}
 		if err != nil {
-			return gcsToObjectError(errors.Trace(err), bucket, key)
+			logger.LogIf(ctx, err)
+			return gcsToObjectError(err, bucket, key)
 		}
 
 		object := l.client.Bucket(bucket).Object(attrs.Name)
@@ -943,44 +1009,44 @@ func (l *gcsGateway) cleanupMultipartUpload(bucket, key, uploadID string) error 
 }
 
 // AbortMultipartUpload aborts a ongoing multipart upload
-func (l *gcsGateway) AbortMultipartUpload(bucket string, key string, uploadID string) error {
-	if err := l.checkUploadIDExists(bucket, key, uploadID); err != nil {
+func (l *gcsGateway) AbortMultipartUpload(ctx context.Context, bucket string, key string, uploadID string) error {
+	if err := l.checkUploadIDExists(ctx, bucket, key, uploadID); err != nil {
 		return err
 	}
-	return l.cleanupMultipartUpload(bucket, key, uploadID)
+	return l.cleanupMultipartUpload(ctx, bucket, key, uploadID)
 }
 
 // CompleteMultipartUpload completes ongoing multipart upload and finalizes object
 // Note that there is a limit (currently 32) to the number of components that can
-// be composed in a single operation. There is a limit (currently 1024) to the total
-// number of components for a given composite object. This means you can append to
-// each object at most 1023 times. There is a per-project rate limit (currently 200)
-// to the number of components you can compose per second. This rate counts both the
-// components being appended to a composite object as well as the components being
-// copied when the composite object of which they are a part is copied.
-func (l *gcsGateway) CompleteMultipartUpload(bucket string, key string, uploadID string, uploadedParts []minio.CompletePart) (minio.ObjectInfo, error) {
+// be composed in a single operation. There is a per-project rate limit (currently 200)
+// to the number of source objects you can compose per second.
+func (l *gcsGateway) CompleteMultipartUpload(ctx context.Context, bucket string, key string, uploadID string, uploadedParts []minio.CompletePart) (minio.ObjectInfo, error) {
 	meta := gcsMultipartMetaName(uploadID)
 	object := l.client.Bucket(bucket).Object(meta)
 
 	partZeroAttrs, err := object.Attrs(l.ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket, key, uploadID)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket, key, uploadID)
 	}
 
 	r, err := object.NewReader(l.ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket, key)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket, key)
 	}
 	defer r.Close()
 
 	// Check version compatibility of the meta file before compose()
 	multipartMeta := gcsMultipartMetaV1{}
 	if err = json.NewDecoder(r).Decode(&multipartMeta); err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket, key)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket, key)
 	}
 
 	if multipartMeta.Version != gcsMinioMultipartMetaCurrentVersion {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(errGCSFormat), bucket, key)
+		logger.LogIf(ctx, errGCSFormat)
+		return minio.ObjectInfo{}, gcsToObjectError(errGCSFormat, bucket, key)
 	}
 
 	// Validate if the gcs.json stores valid entries for the bucket and key.
@@ -997,7 +1063,8 @@ func (l *gcsGateway) CompleteMultipartUpload(bucket string, key string, uploadID
 			uploadedPart.PartNumber, uploadedPart.ETag)))
 		partAttr, pErr := l.client.Bucket(bucket).Object(gcsMultipartDataName(uploadID, uploadedPart.PartNumber, uploadedPart.ETag)).Attrs(l.ctx)
 		if pErr != nil {
-			return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(pErr), bucket, key, uploadID)
+			logger.LogIf(ctx, pErr)
+			return minio.ObjectInfo{}, gcsToObjectError(pErr, bucket, key, uploadID)
 		}
 		partSizes[i] = partAttr.Size
 	}
@@ -1005,11 +1072,16 @@ func (l *gcsGateway) CompleteMultipartUpload(bucket string, key string, uploadID
 	// Error out if parts except last part sizing < 5MiB.
 	for i, size := range partSizes[:len(partSizes)-1] {
 		if size < 5*humanize.MiByte {
-			return minio.ObjectInfo{}, errors.Trace(minio.PartTooSmall{
+			logger.LogIf(ctx, minio.PartTooSmall{
 				PartNumber: uploadedParts[i].PartNumber,
 				PartSize:   size,
 				PartETag:   uploadedParts[i].ETag,
 			})
+			return minio.ObjectInfo{}, minio.PartTooSmall{
+				PartNumber: uploadedParts[i].PartNumber,
+				PartSize:   size,
+				PartETag:   uploadedParts[i].ETag,
+			}
 		}
 	}
 
@@ -1036,7 +1108,8 @@ func (l *gcsGateway) CompleteMultipartUpload(bucket string, key string, uploadID
 			composer.Metadata = partZeroAttrs.Metadata
 
 			if _, err = composer.Run(l.ctx); err != nil {
-				return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket, key)
+				logger.LogIf(ctx, err)
+				return minio.ObjectInfo{}, gcsToObjectError(err, bucket, key)
 			}
 		}
 
@@ -1046,22 +1119,32 @@ func (l *gcsGateway) CompleteMultipartUpload(bucket string, key string, uploadID
 
 	composer := l.client.Bucket(bucket).Object(key).ComposerFrom(parts...)
 	composer.ContentType = partZeroAttrs.ContentType
+	composer.ContentEncoding = partZeroAttrs.ContentEncoding
+	composer.CacheControl = partZeroAttrs.CacheControl
+	composer.ContentDisposition = partZeroAttrs.ContentDisposition
+	composer.ContentLanguage = partZeroAttrs.ContentLanguage
 	composer.Metadata = partZeroAttrs.Metadata
 	attrs, err := composer.Run(l.ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket, key)
+		logger.LogIf(ctx, err)
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket, key)
 	}
-	if err = l.cleanupMultipartUpload(bucket, key, uploadID); err != nil {
-		return minio.ObjectInfo{}, gcsToObjectError(errors.Trace(err), bucket, key)
+	if err = l.cleanupMultipartUpload(ctx, bucket, key, uploadID); err != nil {
+		return minio.ObjectInfo{}, gcsToObjectError(err, bucket, key)
 	}
 	return fromGCSAttrsToObjectInfo(attrs), nil
 }
 
-// SetBucketPolicies - Set policy on bucket
-func (l *gcsGateway) SetBucketPolicies(bucket string, policyInfo policy.BucketAccessPolicy) error {
-	var policies []minio.BucketAccessPolicy
+// SetBucketPolicy - Set policy on bucket
+func (l *gcsGateway) SetBucketPolicy(ctx context.Context, bucket string, bucketPolicy *policy.Policy) error {
+	policyInfo, err := minio.PolicyToBucketAccessPolicy(bucketPolicy)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return gcsToObjectError(err, bucket)
+	}
 
-	for prefix, policy := range policy.GetPolicies(policyInfo.Statements, bucket) {
+	var policies []minio.BucketAccessPolicy
+	for prefix, policy := range miniogopolicy.GetPolicies(policyInfo.Statements, bucket, "") {
 		policies = append(policies, minio.BucketAccessPolicy{
 			Prefix: prefix,
 			Policy: policy,
@@ -1071,67 +1154,105 @@ func (l *gcsGateway) SetBucketPolicies(bucket string, policyInfo policy.BucketAc
 	prefix := bucket + "/*" // For all objects inside the bucket.
 
 	if len(policies) != 1 {
-		return errors.Trace(minio.NotImplemented{})
+		logger.LogIf(ctx, minio.NotImplemented{})
+		return minio.NotImplemented{}
 	}
 	if policies[0].Prefix != prefix {
-		return errors.Trace(minio.NotImplemented{})
+		logger.LogIf(ctx, minio.NotImplemented{})
+		return minio.NotImplemented{}
 	}
 
 	acl := l.client.Bucket(bucket).ACL()
-	if policies[0].Policy == policy.BucketPolicyNone {
+	if policies[0].Policy == miniogopolicy.BucketPolicyNone {
 		if err := acl.Delete(l.ctx, storage.AllUsers); err != nil {
-			return gcsToObjectError(errors.Trace(err), bucket)
+			logger.LogIf(ctx, err)
+			return gcsToObjectError(err, bucket)
 		}
 		return nil
 	}
 
 	var role storage.ACLRole
 	switch policies[0].Policy {
-	case policy.BucketPolicyReadOnly:
+	case miniogopolicy.BucketPolicyReadOnly:
 		role = storage.RoleReader
-	case policy.BucketPolicyWriteOnly:
+	case miniogopolicy.BucketPolicyWriteOnly:
 		role = storage.RoleWriter
 	default:
-		return errors.Trace(minio.NotImplemented{})
+		logger.LogIf(ctx, minio.NotImplemented{})
+		return minio.NotImplemented{}
 	}
 
 	if err := acl.Set(l.ctx, storage.AllUsers, role); err != nil {
-		return gcsToObjectError(errors.Trace(err), bucket)
+		logger.LogIf(ctx, err)
+		return gcsToObjectError(err, bucket)
 	}
 
 	return nil
 }
 
-// GetBucketPolicies - Get policy on bucket
-func (l *gcsGateway) GetBucketPolicies(bucket string) (policy.BucketAccessPolicy, error) {
+// GetBucketPolicy - Get policy on bucket
+func (l *gcsGateway) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Policy, error) {
 	rules, err := l.client.Bucket(bucket).ACL().List(l.ctx)
 	if err != nil {
-		return policy.BucketAccessPolicy{}, gcsToObjectError(errors.Trace(err), bucket)
+		return nil, gcsToObjectError(err, bucket)
 	}
-	policyInfo := policy.BucketAccessPolicy{Version: "2012-10-17"}
+
+	var readOnly, writeOnly bool
 	for _, r := range rules {
 		if r.Entity != storage.AllUsers || r.Role == storage.RoleOwner {
 			continue
 		}
+
 		switch r.Role {
 		case storage.RoleReader:
-			policyInfo.Statements = policy.SetPolicy(policyInfo.Statements, policy.BucketPolicyReadOnly, bucket, "")
+			readOnly = true
 		case storage.RoleWriter:
-			policyInfo.Statements = policy.SetPolicy(policyInfo.Statements, policy.BucketPolicyWriteOnly, bucket, "")
+			writeOnly = true
 		}
 	}
-	// Return NoSuchBucketPolicy error, when policy is not set
-	if len(policyInfo.Statements) == 0 {
-		return policy.BucketAccessPolicy{}, gcsToObjectError(errors.Trace(minio.PolicyNotFound{}), bucket)
+
+	actionSet := policy.NewActionSet()
+	if readOnly {
+		actionSet.Add(policy.GetBucketLocationAction)
+		actionSet.Add(policy.ListBucketAction)
+		actionSet.Add(policy.GetObjectAction)
 	}
-	return policyInfo, nil
+	if writeOnly {
+		actionSet.Add(policy.GetBucketLocationAction)
+		actionSet.Add(policy.ListBucketMultipartUploadsAction)
+		actionSet.Add(policy.AbortMultipartUploadAction)
+		actionSet.Add(policy.DeleteObjectAction)
+		actionSet.Add(policy.ListMultipartUploadPartsAction)
+		actionSet.Add(policy.PutObjectAction)
+	}
+
+	// Return NoSuchBucketPolicy error, when policy is not set
+	if len(actionSet) == 0 {
+		return nil, gcsToObjectError(minio.BucketPolicyNotFound{}, bucket)
+	}
+
+	return &policy.Policy{
+		Version: policy.DefaultVersion,
+		Statements: []policy.Statement{
+			policy.NewStatement(
+				policy.Allow,
+				policy.NewPrincipal("*"),
+				actionSet,
+				policy.NewResourceSet(
+					policy.NewResource(bucket, ""),
+					policy.NewResource(bucket, "*"),
+				),
+				condition.NewFunctions(),
+			),
+		},
+	}, nil
 }
 
-// DeleteBucketPolicies - Delete all policies on bucket
-func (l *gcsGateway) DeleteBucketPolicies(bucket string) error {
+// DeleteBucketPolicy - Delete all policies on bucket
+func (l *gcsGateway) DeleteBucketPolicy(ctx context.Context, bucket string) error {
 	// This only removes the storage.AllUsers policies
 	if err := l.client.Bucket(bucket).ACL().Delete(l.ctx, storage.AllUsers); err != nil {
-		return gcsToObjectError(errors.Trace(err), bucket)
+		return gcsToObjectError(err, bucket)
 	}
 
 	return nil

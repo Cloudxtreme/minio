@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -39,7 +40,7 @@ func testGetObject(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	bucketName := getRandomBucketName()
 	objectName := "test-object"
 	// create bucket.
-	err := obj.MakeBucketWithLocation(bucketName, "")
+	err := obj.MakeBucketWithLocation(context.Background(), bucketName, "")
 	// Stop the test if creation of the bucket fails.
 	if err != nil {
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -68,7 +69,7 @@ func testGetObject(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	// iterate through the above set of inputs and upkoad the object.
 	for i, input := range putObjectInputs {
 		// uploading the object.
-		_, err = obj.PutObject(input.bucketName, input.objectName, mustGetHashReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData["etag"], ""), input.metaData)
+		_, err = obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetHashReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData["etag"], ""), input.metaData)
 		// if object upload fails stop the test.
 		if err != nil {
 			t.Fatalf("Put Object case %d:  Error uploading object: <ERROR> %v", i+1, err)
@@ -106,14 +107,6 @@ func testGetObject(obj ObjectLayer, instanceType string, t TestErrHandler) {
 		// Test case - 5.
 		// Case with invalid object names.
 		{bucketName, "", 0, 0, nil, nil, false, []byte(""), fmt.Errorf("%s", "Object name invalid: "+bucketName+"#")},
-		// Test case - 6.
-		// 	Valid object and bucket names but non-existent bucket.
-		//	{"abc", "def", 0, 0, nil, nil, false, []byte(""), fmt.Errorf("%s", "Bucket not found: abc")},
-		// A custom writer is sent as an argument.
-		// Its designed to return a EOF error after reading `n` bytes, where `n` is the argument when initializing the EOF writer.
-		// This is to simulate the case of cache not filling up completly, since the EOFWriter doesn't allow the write to complete,
-		// the cache gets filled up with partial data. The following up test case will read the object completly, tests the
-		// purging of the cache during the incomplete write.
 		//	Test case - 7.
 		{bucketName, objectName, 0, int64(len(bytesData[0].byteData)), buffers[0], NewEOFWriter(buffers[0], 100), false, []byte{}, io.EOF},
 		// Test case with start offset set to 0 and length set to size of the object.
@@ -152,7 +145,7 @@ func testGetObject(obj ObjectLayer, instanceType string, t TestErrHandler) {
 	}
 
 	for i, testCase := range testCases {
-		err = obj.GetObject(testCase.bucketName, testCase.objectName, testCase.startOffset, testCase.length, testCase.writer)
+		err = obj.GetObject(context.Background(), testCase.bucketName, testCase.objectName, testCase.startOffset, testCase.length, testCase.writer, "")
 		if err != nil && testCase.shouldPass {
 			t.Errorf("Test %d: %s:  Expected to pass, but failed with: <ERROR> %s", i+1, instanceType, err.Error())
 		}
@@ -191,7 +184,7 @@ func testGetObjectPermissionDenied(obj ObjectLayer, instanceType string, disks [
 	// Setup for the tests.
 	bucketName := getRandomBucketName()
 	// create bucket.
-	err := obj.MakeBucketWithLocation(bucketName, "")
+	err := obj.MakeBucketWithLocation(context.Background(), bucketName, "")
 	// Stop the test if creation of the bucket fails.
 	if err != nil {
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -217,7 +210,7 @@ func testGetObjectPermissionDenied(obj ObjectLayer, instanceType string, disks [
 	// iterate through the above set of inputs and upkoad the object.
 	for i, input := range putObjectInputs {
 		// uploading the object.
-		_, err = obj.PutObject(input.bucketName, input.objectName, mustGetHashReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData["etag"], ""), input.metaData)
+		_, err = obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetHashReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData["etag"], ""), input.metaData)
 		// if object upload fails stop the test.
 		if err != nil {
 			t.Fatalf("Put Object case %d:  Error uploading object: <ERROR> %v", i+1, err)
@@ -262,7 +255,7 @@ func testGetObjectPermissionDenied(obj ObjectLayer, instanceType string, disks [
 			}
 		}
 
-		err = obj.GetObject(testCase.bucketName, testCase.objectName, testCase.startOffset, testCase.length, testCase.writer)
+		err = obj.GetObject(context.Background(), testCase.bucketName, testCase.objectName, testCase.startOffset, testCase.length, testCase.writer, "")
 		if err != nil && testCase.shouldPass {
 			t.Errorf("Test %d: %s:  Expected to pass, but failed with: <ERROR> %s", i+1, instanceType, err.Error())
 		}
@@ -301,7 +294,7 @@ func testGetObjectDiskNotFound(obj ObjectLayer, instanceType string, disks []str
 	bucketName := getRandomBucketName()
 	objectName := "test-object"
 	// create bucket.
-	err := obj.MakeBucketWithLocation(bucketName, "")
+	err := obj.MakeBucketWithLocation(context.Background(), bucketName, "")
 	// Stop the test if creation of the bucket fails.
 	if err != nil {
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -330,7 +323,7 @@ func testGetObjectDiskNotFound(obj ObjectLayer, instanceType string, disks []str
 	// iterate through the above set of inputs and upkoad the object.
 	for i, input := range putObjectInputs {
 		// uploading the object.
-		_, err = obj.PutObject(input.bucketName, input.objectName, mustGetHashReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData["etag"], ""), input.metaData)
+		_, err = obj.PutObject(context.Background(), input.bucketName, input.objectName, mustGetHashReader(t, bytes.NewBuffer(input.textData), input.contentLength, input.metaData["etag"], ""), input.metaData)
 		// if object upload fails stop the test.
 		if err != nil {
 			t.Fatalf("Put Object case %d:  Error uploading object: <ERROR> %v", i+1, err)
@@ -374,14 +367,6 @@ func testGetObjectDiskNotFound(obj ObjectLayer, instanceType string, disks []str
 		// Test case - 5.
 		// Case with invalid object names.
 		{bucketName, "", 0, 0, nil, nil, false, []byte(""), fmt.Errorf("%s", "Object name invalid: "+bucketName+"#")},
-		// Test case - 6.
-		// 	Valid object and bucket names but non-existent bucket.
-		//	{"abc", "def", 0, 0, nil, nil, false, []byte(""), fmt.Errorf("%s", "Bucket not found: abc")},
-		// A custom writer is sent as an argument.
-		// Its designed to return a EOF error after reading `n` bytes, where `n` is the argument when initializing the EOF writer.
-		// This is to simulate the case of cache not filling up completly, since the EOFWriter doesn't allow the write to complete,
-		// the cache gets filled up with partial data. The following up test case will read the object completly, tests the
-		// purging of the cache during the incomplete write.
 		//	Test case - 7.
 		{bucketName, objectName, 0, int64(len(bytesData[0].byteData)), buffers[0], NewEOFWriter(buffers[0], 100), false, []byte{}, io.EOF},
 		// Test case with start offset set to 0 and length set to size of the object.
@@ -423,7 +408,7 @@ func testGetObjectDiskNotFound(obj ObjectLayer, instanceType string, disks []str
 	}
 
 	for i, testCase := range testCases {
-		err = obj.GetObject(testCase.bucketName, testCase.objectName, testCase.startOffset, testCase.length, testCase.writer)
+		err = obj.GetObject(context.Background(), testCase.bucketName, testCase.objectName, testCase.startOffset, testCase.length, testCase.writer, "")
 		if err != nil && testCase.shouldPass {
 			t.Errorf("Test %d: %s:  Expected to pass, but failed with: <ERROR> %s", i+1, instanceType, err.Error())
 		}

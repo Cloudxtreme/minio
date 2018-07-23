@@ -20,14 +20,15 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/minio/minio-go/pkg/set"
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/mountinfo"
 )
 
@@ -45,7 +46,8 @@ const (
 // Endpoint - any type of endpoint.
 type Endpoint struct {
 	*url.URL
-	IsLocal bool
+	IsLocal  bool
+	SetIndex int
 }
 
 func (endpoint Endpoint) String() string {
@@ -166,38 +168,22 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 // EndpointList - list of same type of endpoint.
 type EndpointList []Endpoint
 
-// Swap - helper method for sorting.
-func (endpoints EndpointList) Swap(i, j int) {
-	endpoints[i], endpoints[j] = endpoints[j], endpoints[i]
-}
-
-// Len - helper method for sorting.
-func (endpoints EndpointList) Len() int {
-	return len(endpoints)
-}
-
-// Less - helper method for sorting.
-func (endpoints EndpointList) Less(i, j int) bool {
-	return endpoints[i].String() < endpoints[j].String()
-}
-
 // IsHTTPS - returns true if secure for URLEndpointType.
 func (endpoints EndpointList) IsHTTPS() bool {
 	return endpoints[0].IsHTTPS()
 }
 
+// GetString - returns endpoint string of i-th endpoint (0-based),
+// and empty string for invalid indexes.
+func (endpoints EndpointList) GetString(i int) string {
+	if i < 0 || i >= len(endpoints) {
+		return ""
+	}
+	return endpoints[i].String()
+}
+
 // NewEndpointList - returns new endpoint list based on input args.
 func NewEndpointList(args ...string) (endpoints EndpointList, err error) {
-	// isValidDistribution - checks whether given count is a valid distribution for erasure coding.
-	isValidDistribution := func(count int) bool {
-		return (count >= minErasureBlocks && count <= maxErasureBlocks && count%2 == 0)
-	}
-
-	// Check whether no. of args are valid for XL distribution.
-	if !isValidDistribution(len(args)) {
-		return nil, fmt.Errorf("A total of %d endpoints were found. For erasure mode it should be an even number between %d and %d", len(args), minErasureBlocks, maxErasureBlocks)
-	}
-
 	var endpointType EndpointType
 	var scheme string
 
@@ -227,8 +213,6 @@ func NewEndpointList(args ...string) (endpoints EndpointList, err error) {
 		endpoints = append(endpoints, endpoint)
 	}
 
-	sort.Sort(endpoints)
-
 	return endpoints, nil
 }
 
@@ -249,7 +233,7 @@ func checkCrossDeviceMounts(endpoints EndpointList) (err error) {
 }
 
 // CreateEndpoints - validates and creates new endpoints for given args.
-func CreateEndpoints(serverAddr string, args ...string) (string, EndpointList, SetupType, error) {
+func CreateEndpoints(serverAddr string, args ...[]string) (string, EndpointList, SetupType, error) {
 	var endpoints EndpointList
 	var setupType SetupType
 	var err error
@@ -262,33 +246,44 @@ func CreateEndpoints(serverAddr string, args ...string) (string, EndpointList, S
 	_, serverAddrPort := mustSplitHostPort(serverAddr)
 
 	// For single arg, return FS setup.
-	if len(args) == 1 {
+	if len(args) == 1 && len(args[0]) == 1 {
 		var endpoint Endpoint
-		endpoint, err = NewEndpoint(args[0])
+		endpoint, err = NewEndpoint(args[0][0])
 		if err != nil {
 			return serverAddr, endpoints, setupType, err
 		}
 		if endpoint.Type() != PathEndpointType {
-			return serverAddr, endpoints, setupType, fmt.Errorf("use path style endpoint for FS setup")
+			return serverAddr, endpoints, setupType, uiErrInvalidFSEndpoint(nil).Msg("use path style endpoint for FS setup")
 		}
 		endpoints = append(endpoints, endpoint)
 		setupType = FSSetupType
 
 		// Check for cross device mounts if any.
 		if err = checkCrossDeviceMounts(endpoints); err != nil {
-			return serverAddr, endpoints, setupType, err
+			return serverAddr, endpoints, setupType, uiErrInvalidFSEndpoint(nil).Msg(err.Error())
 		}
 		return serverAddr, endpoints, setupType, nil
 	}
 
-	// Convert args to endpoints
-	if endpoints, err = NewEndpointList(args...); err != nil {
-		return serverAddr, endpoints, setupType, err
-	}
+	for i, iargs := range args {
+		var newEndpoints EndpointList
+		// Convert args to endpoints
+		var eps EndpointList
+		eps, err = NewEndpointList(iargs...)
+		if err != nil {
+			return serverAddr, endpoints, setupType, uiErrInvalidErasureEndpoints(nil).Msg(err.Error())
+		}
 
-	// Check for cross device mounts if any.
-	if err = checkCrossDeviceMounts(endpoints); err != nil {
-		return serverAddr, endpoints, setupType, err
+		// Check for cross device mounts if any.
+		if err = checkCrossDeviceMounts(eps); err != nil {
+			return serverAddr, endpoints, setupType, uiErrInvalidErasureEndpoints(nil).Msg(err.Error())
+		}
+
+		for _, ep := range eps {
+			ep.SetIndex = i
+			newEndpoints = append(newEndpoints, ep)
+		}
+		endpoints = append(endpoints, newEndpoints...)
 	}
 
 	// Return XL setup when all endpoints are path style.
@@ -322,10 +317,10 @@ func CreateEndpoints(serverAddr string, args ...string) (string, EndpointList, S
 
 	// No local endpoint found.
 	if localEndpointCount == 0 {
-		return serverAddr, endpoints, setupType, fmt.Errorf("no endpoint found for this host")
+		return serverAddr, endpoints, setupType, uiErrInvalidErasureEndpoints(nil).Msg("no endpoint pointing to the local machine is found")
 	}
 
-	// Check whether same path is not used in endpoints of a host.
+	// Check whether same path is not used in endpoints of a host on different port.
 	{
 		pathIPMap := make(map[string]set.StringSet)
 		for _, endpoint := range endpoints {
@@ -337,10 +332,9 @@ func CreateEndpoints(serverAddr string, args ...string) (string, EndpointList, S
 			hostIPSet, _ := getHostIP4(host)
 			if IPSet, ok := pathIPMap[endpoint.Path]; ok {
 				if !IPSet.Intersection(hostIPSet).IsEmpty() {
-					err = fmt.Errorf("path '%s' can not be served by different port on same address", endpoint.Path)
-					return serverAddr, endpoints, setupType, err
+					return serverAddr, endpoints, setupType,
+						uiErrInvalidErasureEndpoints(nil).Msg(fmt.Sprintf("path '%s' can not be served by different port on same address", endpoint.Path))
 				}
-
 				pathIPMap[endpoint.Path] = IPSet.Union(hostIPSet)
 			} else {
 				pathIPMap[endpoint.Path] = hostIPSet
@@ -348,16 +342,30 @@ func CreateEndpoints(serverAddr string, args ...string) (string, EndpointList, S
 		}
 	}
 
+	// Check whether same path is used for more than 1 local endpoints.
+	{
+		localPathSet := set.CreateStringSet()
+		for _, endpoint := range endpoints {
+			if !endpoint.IsLocal {
+				continue
+			}
+			if localPathSet.Contains(endpoint.Path) {
+				return serverAddr, endpoints, setupType,
+					uiErrInvalidErasureEndpoints(nil).Msg(fmt.Sprintf("path '%s' cannot be served by different address on same server", endpoint.Path))
+			}
+			localPathSet.Add(endpoint.Path)
+		}
+	}
+
 	// Check whether serverAddrPort matches at least in one of port used in local endpoints.
 	{
 		if !localPortSet.Contains(serverAddrPort) {
 			if len(localPortSet) > 1 {
-				err = fmt.Errorf("port number in server address must match with one of the port in local endpoints")
-			} else {
-				err = fmt.Errorf("server address and local endpoint have different ports")
+				return serverAddr, endpoints, setupType,
+					uiErrInvalidErasureEndpoints(nil).Msg("port number in server address must match with one of the port in local endpoints")
 			}
-
-			return serverAddr, endpoints, setupType, err
+			return serverAddr, endpoints, setupType,
+				uiErrInvalidErasureEndpoints(nil).Msg("server address and local endpoint have different ports")
 		}
 	}
 
@@ -366,7 +374,7 @@ func CreateEndpoints(serverAddr string, args ...string) (string, EndpointList, S
 		// If all endpoints have same port number, then this is XL setup using URL style endpoints.
 		if len(localPortSet) == 1 {
 			if len(localServerAddrSet) > 1 {
-				// TODO: Eventhough all endpoints are local, the local host is referred by different IP/name.
+				// TODO: Even though all endpoints are local, the local host is referred by different IP/name.
 				// eg '172.0.0.1', 'localhost' and 'mylocalhostname' point to same local host.
 				//
 				// In this case, we bind to 0.0.0.0 ie to all interfaces.
@@ -380,7 +388,7 @@ func CreateEndpoints(serverAddr string, args ...string) (string, EndpointList, S
 			return serverAddr, endpoints, setupType, nil
 		}
 
-		// Eventhough all endpoints are local, but those endpoints use different ports.
+		// Even though all endpoints are local, but those endpoints use different ports.
 		// This means it is DistXL setup.
 	} else {
 		// This is DistXL setup.
@@ -392,7 +400,7 @@ func CreateEndpoints(serverAddr string, args ...string) (string, EndpointList, S
 			}
 
 			ipList, err := getHostIP4(host)
-			fatalIf(err, "unexpected error when resolving host '%s'", host)
+			logger.FatalIf(err, "unexpected error when resolving host '%s'", host)
 
 			// Filter ipList by IPs those start with '127.'.
 			loopBackIPs := ipList.FuncMatch(func(ip string, matchString string) bool {
@@ -418,6 +426,25 @@ func CreateEndpoints(serverAddr string, args ...string) (string, EndpointList, S
 		}
 	}
 
+	uniqueArgs := set.NewStringSet()
+	for _, endpoint := range endpoints {
+		uniqueArgs.Add(endpoint.Host)
+	}
+
+	// Error out if we have more than serverCommandLineArgsMax unique servers.
+	if len(uniqueArgs.ToSlice()) > serverCommandLineArgsMax {
+		err := fmt.Errorf("Unsupported number of endpoints (%s), total number of servers cannot be more than %d", endpoints, serverCommandLineArgsMax)
+		return serverAddr, endpoints, setupType, err
+	}
+
+	// Error out if we have less than 2 unique servers.
+	if len(uniqueArgs.ToSlice()) < 2 && setupType == DistXLSetupType {
+		err := fmt.Errorf("Unsupported number of endpoints (%s), minimum number of servers cannot be less than 2 in distributed setup", endpoints)
+		return serverAddr, endpoints, setupType, err
+	}
+
+	updateDomainIPs(uniqueArgs)
+
 	setupType = DistXLSetupType
 	return serverAddr, endpoints, setupType, nil
 }
@@ -438,9 +465,13 @@ func GetLocalPeer(endpoints EndpointList) (localPeer string) {
 		}
 	}
 	if peerSet.IsEmpty() {
-		// If local peer is empty can happen in FS or Erasure coded mode.
-		// then set the value to globalMinioAddr instead.
-		return globalMinioAddr
+		// Local peer can be empty in FS or Erasure coded mode.
+		// If so, return globalMinioHost + globalMinioPort value.
+		if globalMinioHost != "" {
+			return globalMinioHost + ":" + globalMinioPort
+		}
+
+		return "127.0.0.1:" + globalMinioPort
 	}
 	return peerSet.ToSlice()[0]
 }
@@ -464,4 +495,23 @@ func GetRemotePeers(endpoints EndpointList) []string {
 	}
 
 	return peerSet.ToSlice()
+}
+
+// In federated and distributed setup, update IP addresses of the hosts passed in command line
+// if MINIO_PUBLIC_IPS are not set manually
+func updateDomainIPs(endPoints set.StringSet) {
+	_, dok := os.LookupEnv("MINIO_DOMAIN")
+	_, eok := os.LookupEnv("MINIO_ETCD_ENDPOINTS")
+	_, iok := os.LookupEnv("MINIO_PUBLIC_IPS")
+	if dok && eok && !iok {
+		globalDomainIPs = set.NewStringSet()
+		for e := range endPoints {
+			host, _, _ := net.SplitHostPort(e)
+			ipList, _ := getHostIP4(host)
+			remoteIPList := ipList.FuncMatch(func(ip string, matchString string) bool {
+				return !strings.HasPrefix(ip, "127.")
+			}, "")
+			globalDomainIPs.Add(remoteIPList.ToSlice()[0])
+		}
+	}
 }

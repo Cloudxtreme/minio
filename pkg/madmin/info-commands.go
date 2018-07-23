@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"time"
 )
 
@@ -39,12 +38,14 @@ const (
 	// Add your own backend.
 )
 
+// DriveInfo - represents each drive info, describing
+// status, uuid and endpoint.
+type DriveInfo HealDriveInfo
+
 // StorageInfo - represents total capacity of underlying storage.
 type StorageInfo struct {
-	// Total disk space.
-	Total int64
-	// Free available disk space.
-	Free int64
+	Used uint64 // Total used spaced per tenant.
+
 	// Backend type.
 	Backend struct {
 		// Represents various backend types, currently on FS and Erasure.
@@ -53,8 +54,13 @@ type StorageInfo struct {
 		// Following fields are only meaningful if BackendType is Erasure.
 		OnlineDisks      int // Online disks during server startup.
 		OfflineDisks     int // Offline disks during server startup.
+		StandardSCData   int // Data disks for currently configured Standard storage class.
 		StandardSCParity int // Parity disks for currently configured Standard storage class.
+		RRSCData         int // Data disks for currently configured Reduced Redundancy storage class.
 		RRSCParity       int // Parity disks for currently configured Reduced Redundancy storage class.
+
+		// List of all disk status, this is only meaningful if BackendType is Erasure.
+		Sets [][]DriveInfo
 	}
 }
 
@@ -115,13 +121,7 @@ type ServerInfo struct {
 // ServerInfo - Connect to a minio server and call Server Info Management API
 // to fetch server's information represented by ServerInfo structure
 func (adm *AdminClient) ServerInfo() ([]ServerInfo, error) {
-	// Prepare web service request
-	reqData := requestData{}
-	reqData.queryValues = make(url.Values)
-	reqData.queryValues.Set("info", "")
-	reqData.customHeaders = make(http.Header)
-
-	resp, err := adm.executeMethod("GET", reqData)
+	resp, err := adm.executeMethod("GET", requestData{relPath: "/v1/info"})
 	defer closeResponse(resp)
 	if err != nil {
 		return nil, err

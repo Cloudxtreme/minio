@@ -36,12 +36,6 @@ var errDiskFull = errors.New("disk path full")
 // errDiskNotFound - cannot find the underlying configured disk anymore.
 var errDiskNotFound = errors.New("disk not found")
 
-// errDiskNotFoundFromNetError - cannot find the underlying configured disk anymore due to network error.
-var errDiskNotFoundFromNetError = errors.New("disk not found from net error")
-
-// errDiskNotFoundFromShutdown - cannot find the underlying configured disk anymore due to rpc shutdown.
-var errDiskNotFoundFromRPCShutdown = errors.New("disk not found from rpc shutdown")
-
 // errFaultyRemoteDisk - remote disk is faulty.
 var errFaultyRemoteDisk = errors.New("remote disk is faulty")
 
@@ -81,6 +75,9 @@ var errBitrotHashAlgoInvalid = errors.New("bit-rot hash algorithm is invalid")
 
 // errCrossDeviceLink - rename across devices not allowed.
 var errCrossDeviceLink = errors.New("Rename across devices not allowed, please fix your backend configuration")
+
+// errMinDiskSize - cannot create volume or files when disk size is less than threshold.
+var errMinDiskSize = errors.New("The disk size is less than the minimum threshold")
 
 // hashMisMatchError - represents a bit-rot hash verification failure
 // error.

@@ -18,37 +18,15 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/ioutil"
 	"os"
 	"path"
 	"testing"
 
-	"github.com/minio/minio/pkg/errors"
 	"github.com/minio/minio/pkg/lock"
 )
-
-// Tests - fsMkdirAll()
-func TestFSMkdirAll(t *testing.T) {
-	// create posix test setup
-	_, path, err := newPosixTestSetup()
-	if err != nil {
-		t.Fatalf("Unable to create posix test setup, %s", err)
-	}
-	defer os.RemoveAll(path)
-
-	if err = fsMkdirAll(""); errors.Cause(err) != errInvalidArgument {
-		t.Fatal("Unexpected error", err)
-	}
-
-	if err = fsMkdirAll(pathJoin(path, "my-obj-del-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001")); errors.Cause(err) != errFileNameTooLong {
-		t.Fatal("Unexpected error", err)
-	}
-
-	if err = fsMkdirAll(pathJoin(path, "success-vol", "success-object")); err != nil {
-		t.Fatal("Unexpected error", err)
-	}
-}
 
 func TestFSRenameFile(t *testing.T) {
 	// create posix test setup
@@ -58,19 +36,19 @@ func TestFSRenameFile(t *testing.T) {
 	}
 	defer os.RemoveAll(path)
 
-	if err = fsMkdir(pathJoin(path, "testvolume1")); err != nil {
+	if err = fsMkdir(context.Background(), pathJoin(path, "testvolume1")); err != nil {
 		t.Fatal(err)
 	}
-	if err = fsRenameFile(pathJoin(path, "testvolume1"), pathJoin(path, "testvolume2")); err != nil {
+	if err = fsRenameFile(context.Background(), pathJoin(path, "testvolume1"), pathJoin(path, "testvolume2")); err != nil {
 		t.Fatal(err)
 	}
-	if err = fsRenameFile(pathJoin(path, "testvolume1"), pathJoin(path, "testvolume2")); errors.Cause(err) != errFileNotFound {
+	if err = fsRenameFile(context.Background(), pathJoin(path, "testvolume1"), pathJoin(path, "testvolume2")); err != errFileNotFound {
 		t.Fatal(err)
 	}
-	if err = fsRenameFile(pathJoin(path, "my-obj-del-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"), pathJoin(path, "testvolume2")); errors.Cause(err) != errFileNameTooLong {
+	if err = fsRenameFile(context.Background(), pathJoin(path, "my-obj-del-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"), pathJoin(path, "testvolume2")); err != errFileNameTooLong {
 		t.Fatal("Unexpected error", err)
 	}
-	if err = fsRenameFile(pathJoin(path, "testvolume1"), pathJoin(path, "my-obj-del-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001")); errors.Cause(err) != errFileNameTooLong {
+	if err = fsRenameFile(context.Background(), pathJoin(path, "testvolume1"), pathJoin(path, "my-obj-del-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001")); err != errFileNameTooLong {
 		t.Fatal("Unexpected error", err)
 	}
 }
@@ -85,30 +63,30 @@ func TestFSStats(t *testing.T) {
 
 	// Setup test environment.
 
-	if err = fsMkdir(""); errors.Cause(err) != errInvalidArgument {
+	if err = fsMkdir(context.Background(), ""); err != errInvalidArgument {
 		t.Fatal("Unexpected error", err)
 	}
 
-	if err = fsMkdir(pathJoin(path, "my-obj-del-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001")); errors.Cause(err) != errFileNameTooLong {
+	if err = fsMkdir(context.Background(), pathJoin(path, "my-obj-del-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001")); err != errFileNameTooLong {
 		t.Fatal("Unexpected error", err)
 	}
 
-	if err = fsMkdir(pathJoin(path, "success-vol")); err != nil {
+	if err = fsMkdir(context.Background(), pathJoin(path, "success-vol")); err != nil {
 		t.Fatalf("Unable to create volume, %s", err)
 	}
 
 	var reader = bytes.NewReader([]byte("Hello, world"))
-	if _, err = fsCreateFile(pathJoin(path, "success-vol", "success-file"), reader, nil, 0); err != nil {
+	if _, err = fsCreateFile(context.Background(), pathJoin(path, "success-vol", "success-file"), reader, nil, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
 	// Seek back.
 	reader.Seek(0, 0)
 
-	if err = fsMkdir(pathJoin(path, "success-vol", "success-file")); errors.Cause(err) != errVolumeExists {
+	if err = fsMkdir(context.Background(), pathJoin(path, "success-vol", "success-file")); err != errVolumeExists {
 		t.Fatal("Unexpected error", err)
 	}
 
-	if _, err = fsCreateFile(pathJoin(path, "success-vol", "path/to/success-file"), reader, nil, 0); err != nil {
+	if _, err = fsCreateFile(context.Background(), pathJoin(path, "success-vol", "path/to/success-file"), reader, nil, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
 	// Seek back.
@@ -158,7 +136,7 @@ func TestFSStats(t *testing.T) {
 			srcFSPath:   path,
 			srcVol:      "success-vol",
 			srcPath:     "path",
-			expectedErr: errFileAccessDenied,
+			expectedErr: errFileNotFound,
 		},
 		// Test case - 6.
 		// Test case with src path segment > 255.
@@ -191,12 +169,12 @@ func TestFSStats(t *testing.T) {
 
 	for i, testCase := range testCases {
 		if testCase.srcPath != "" {
-			if _, err := fsStatFile(pathJoin(testCase.srcFSPath, testCase.srcVol,
-				testCase.srcPath)); errors.Cause(err) != testCase.expectedErr {
+			if _, err := fsStatFile(context.Background(), pathJoin(testCase.srcFSPath, testCase.srcVol,
+				testCase.srcPath)); err != testCase.expectedErr {
 				t.Fatalf("TestPosix case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 			}
 		} else {
-			if _, err := fsStatVolume(pathJoin(testCase.srcFSPath, testCase.srcVol)); errors.Cause(err) != testCase.expectedErr {
+			if _, err := fsStatVolume(context.Background(), pathJoin(testCase.srcFSPath, testCase.srcVol)); err != testCase.expectedErr {
 				t.Fatalf("TestPosix case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 			}
 		}
@@ -211,20 +189,20 @@ func TestFSCreateAndOpen(t *testing.T) {
 	}
 	defer os.RemoveAll(path)
 
-	if err = fsMkdir(pathJoin(path, "success-vol")); err != nil {
+	if err = fsMkdir(context.Background(), pathJoin(path, "success-vol")); err != nil {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 
-	if _, err = fsCreateFile("", nil, nil, 0); errors.Cause(err) != errInvalidArgument {
+	if _, err = fsCreateFile(context.Background(), "", nil, nil, 0); err != errInvalidArgument {
 		t.Fatal("Unexpected error", err)
 	}
 
-	if _, _, err = fsOpenFile("", -1); errors.Cause(err) != errInvalidArgument {
+	if _, _, err = fsOpenFile(context.Background(), "", -1); err != errInvalidArgument {
 		t.Fatal("Unexpected error", err)
 	}
 
 	var reader = bytes.NewReader([]byte("Hello, world"))
-	if _, err = fsCreateFile(pathJoin(path, "success-vol", "success-file"), reader, nil, 0); err != nil {
+	if _, err = fsCreateFile(context.Background(), pathJoin(path, "success-vol", "success-file"), reader, nil, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
 	// Seek back.
@@ -252,18 +230,18 @@ func TestFSCreateAndOpen(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		_, err = fsCreateFile(pathJoin(path, testCase.srcVol, testCase.srcPath), reader, nil, 0)
-		if errors.Cause(err) != testCase.expectedErr {
+		_, err = fsCreateFile(context.Background(), pathJoin(path, testCase.srcVol, testCase.srcPath), reader, nil, 0)
+		if err != testCase.expectedErr {
 			t.Errorf("Test case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 		}
-		_, _, err = fsOpenFile(pathJoin(path, testCase.srcVol, testCase.srcPath), 0)
-		if errors.Cause(err) != testCase.expectedErr {
+		_, _, err = fsOpenFile(context.Background(), pathJoin(path, testCase.srcVol, testCase.srcPath), 0)
+		if err != testCase.expectedErr {
 			t.Errorf("Test case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 		}
 	}
 
 	// Attempt to open a directory.
-	if _, _, err = fsOpenFile(pathJoin(path), 0); errors.Cause(err) != errIsNotRegular {
+	if _, _, err = fsOpenFile(context.Background(), pathJoin(path), 0); err != errIsNotRegular {
 		t.Fatal("Unexpected error", err)
 	}
 }
@@ -277,20 +255,20 @@ func TestFSDeletes(t *testing.T) {
 	defer os.RemoveAll(path)
 
 	// Setup test environment.
-	if err = fsMkdir(pathJoin(path, "success-vol")); err != nil {
+	if err = fsMkdir(context.Background(), pathJoin(path, "success-vol")); err != nil {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 
 	var buf = make([]byte, 4096)
 	var reader = bytes.NewReader([]byte("Hello, world"))
-	if _, err = fsCreateFile(pathJoin(path, "success-vol", "success-file"), reader, buf, reader.Size()); err != nil {
+	if _, err = fsCreateFile(context.Background(), pathJoin(path, "success-vol", "success-file"), reader, buf, reader.Size()); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
 	// Seek back.
 	reader.Seek(0, io.SeekStart)
 
 	// folder is not empty
-	err = fsMkdir(pathJoin(path, "success-vol", "not-empty"))
+	err = fsMkdir(context.Background(), pathJoin(path, "success-vol", "not-empty"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,10 +278,10 @@ func TestFSDeletes(t *testing.T) {
 	}
 
 	// recursive
-	if err = fsMkdir(pathJoin(path, "success-vol", "parent")); err != nil {
+	if err = fsMkdir(context.Background(), pathJoin(path, "success-vol", "parent")); err != nil {
 		t.Fatal(err)
 	}
-	if err = fsMkdir(pathJoin(path, "success-vol", "parent", "dir")); err != nil {
+	if err = fsMkdir(context.Background(), pathJoin(path, "success-vol", "parent", "dir")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -365,7 +343,7 @@ func TestFSDeletes(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		if err = fsDeleteFile(testCase.basePath, pathJoin(testCase.basePath, testCase.srcVol, testCase.srcPath)); errors.Cause(err) != testCase.expectedErr {
+		if err = fsDeleteFile(context.Background(), testCase.basePath, pathJoin(testCase.basePath, testCase.srcVol, testCase.srcPath)); err != testCase.expectedErr {
 			t.Errorf("Test case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 		}
 	}
@@ -380,7 +358,7 @@ func BenchmarkFSDeleteFile(b *testing.B) {
 	defer os.RemoveAll(path)
 
 	// Setup test environment.
-	if err = fsMkdir(pathJoin(path, "benchmark")); err != nil {
+	if err = fsMkdir(context.Background(), pathJoin(path, "benchmark")); err != nil {
 		b.Fatalf("Unable to create directory, %s", err)
 	}
 
@@ -397,7 +375,7 @@ func BenchmarkFSDeleteFile(b *testing.B) {
 		}
 		b.StartTimer()
 
-		err = fsDeleteFile(benchDir, filename)
+		err = fsDeleteFile(context.Background(), benchDir, filename)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -414,18 +392,18 @@ func TestFSRemoves(t *testing.T) {
 	defer os.RemoveAll(path)
 
 	// Setup test environment.
-	if err = fsMkdir(pathJoin(path, "success-vol")); err != nil {
+	if err = fsMkdir(context.Background(), pathJoin(path, "success-vol")); err != nil {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 
 	var reader = bytes.NewReader([]byte("Hello, world"))
-	if _, err = fsCreateFile(pathJoin(path, "success-vol", "success-file"), reader, nil, 0); err != nil {
+	if _, err = fsCreateFile(context.Background(), pathJoin(path, "success-vol", "success-file"), reader, nil, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
 	// Seek back.
 	reader.Seek(0, 0)
 
-	if _, err = fsCreateFile(pathJoin(path, "success-vol", "success-file-new"), reader, nil, 0); err != nil {
+	if _, err = fsCreateFile(context.Background(), pathJoin(path, "success-vol", "success-file-new"), reader, nil, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
 	// Seek back.
@@ -499,25 +477,25 @@ func TestFSRemoves(t *testing.T) {
 
 	for i, testCase := range testCases {
 		if testCase.srcPath != "" {
-			if err = fsRemoveFile(pathJoin(testCase.srcFSPath, testCase.srcVol, testCase.srcPath)); errors.Cause(err) != testCase.expectedErr {
+			if err = fsRemoveFile(context.Background(), pathJoin(testCase.srcFSPath, testCase.srcVol, testCase.srcPath)); err != testCase.expectedErr {
 				t.Errorf("Test case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 			}
 		} else {
-			if err = fsRemoveDir(pathJoin(testCase.srcFSPath, testCase.srcVol, testCase.srcPath)); errors.Cause(err) != testCase.expectedErr {
+			if err = fsRemoveDir(context.Background(), pathJoin(testCase.srcFSPath, testCase.srcVol, testCase.srcPath)); err != testCase.expectedErr {
 				t.Error(err)
 			}
 		}
 	}
 
-	if err = fsRemoveAll(pathJoin(path, "success-vol")); err != nil {
+	if err = fsRemoveAll(context.Background(), pathJoin(path, "success-vol")); err != nil {
 		t.Fatal(err)
 	}
 
-	if err = fsRemoveAll(""); errors.Cause(err) != errInvalidArgument {
+	if err = fsRemoveAll(context.Background(), ""); err != errInvalidArgument {
 		t.Fatal(err)
 	}
 
-	if err = fsRemoveAll("my-obj-del-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"); errors.Cause(err) != errFileNameTooLong {
+	if err = fsRemoveAll(context.Background(), "my-obj-del-0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"); err != errFileNameTooLong {
 		t.Fatal(err)
 	}
 }
@@ -531,14 +509,14 @@ func TestFSRemoveMeta(t *testing.T) {
 	defer os.RemoveAll(fsPath)
 
 	// Setup test environment.
-	if err = fsMkdir(pathJoin(fsPath, "success-vol")); err != nil {
+	if err = fsMkdir(context.Background(), pathJoin(fsPath, "success-vol")); err != nil {
 		t.Fatalf("Unable to create directory, %s", err)
 	}
 
 	filePath := pathJoin(fsPath, "success-vol", "success-file")
 
 	var reader = bytes.NewReader([]byte("Hello, world"))
-	if _, err = fsCreateFile(filePath, reader, nil, 0); err != nil {
+	if _, err = fsCreateFile(context.Background(), filePath, reader, nil, 0); err != nil {
 		t.Fatalf("Unable to create file, %s", err)
 	}
 
@@ -557,7 +535,7 @@ func TestFSRemoveMeta(t *testing.T) {
 		t.Fatal(tmpErr)
 	}
 
-	if err := fsRemoveMeta(fsPath, filePath, tmpDir); err != nil {
+	if err := fsRemoveMeta(context.Background(), fsPath, filePath, tmpDir); err != nil {
 		t.Fatalf("Unable to remove file, %s", err)
 	}
 
@@ -567,5 +545,35 @@ func TestFSRemoveMeta(t *testing.T) {
 
 	if _, err := os.Stat((path.Dir(filePath))); !os.IsNotExist(err) {
 		t.Fatalf("`%s` parent directory found though it should have been deleted.", filePath)
+	}
+}
+
+func TestFSIsDir(t *testing.T) {
+	dirPath, err := ioutil.TempDir(globalTestTmpDir, "minio-")
+	if err != nil {
+		t.Fatalf("Unable to create tmp directory %s", err)
+	}
+	defer os.RemoveAll(dirPath)
+
+	if !fsIsDir(context.Background(), dirPath) {
+		t.Fatalf("Expected %s to be a directory", dirPath)
+	}
+}
+
+func TestFSIsFile(t *testing.T) {
+	dirPath, err := ioutil.TempDir(globalTestTmpDir, "minio-")
+	if err != nil {
+		t.Fatalf("Unable to create tmp directory %s", err)
+	}
+	defer os.RemoveAll(dirPath)
+
+	filePath := pathJoin(dirPath, "tmpfile")
+
+	if err = ioutil.WriteFile(filePath, nil, 0777); err != nil {
+		t.Fatalf("Unable to create file %s", filePath)
+	}
+
+	if !fsIsFile(context.Background(), filePath) {
+		t.Fatalf("Expected %s to be a file", filePath)
 	}
 }

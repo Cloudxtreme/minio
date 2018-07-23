@@ -17,8 +17,11 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	pathutil "path"
+	"runtime"
+	"strings"
 	"sync"
 
 	"fmt"
@@ -26,13 +29,19 @@ import (
 
 	"github.com/minio/dsync"
 	"github.com/minio/lsync"
+	"github.com/minio/minio-go/pkg/set"
+	"github.com/minio/minio/cmd/logger"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
 // Global name space lock.
 var globalNSMutex *nsLockMap
 
-// Global lock servers
-var globalLockServers []*lockServer
+// Global lock server one per server.
+var globalLockServer *lockRPCReceiver
+
+// Instance of dsync for distributed clients.
+var globalDsync *dsync.Dsync
 
 // RWLocker - locker interface to introduce GetRLock, RUnlock.
 type RWLocker interface {
@@ -53,48 +62,44 @@ type RWLockerSync interface {
 // Initialize distributed locking only in case of distributed setup.
 // Returns lock clients and the node index for the current server.
 func newDsyncNodes(endpoints EndpointList) (clnts []dsync.NetLocker, myNode int) {
-	cred := globalServerConfig.GetCredential()
-	clnts = make([]dsync.NetLocker, len(endpoints))
 	myNode = -1
-	for index, endpoint := range endpoints {
-		if !endpoint.IsLocal {
-			// For a remote endpoints setup a lock RPC client.
-			clnts[index] = newLockRPCClient(authConfig{
-				accessKey:       cred.AccessKey,
-				secretKey:       cred.SecretKey,
-				serverAddr:      endpoint.Host,
-				secureConn:      globalIsSSL,
-				serviceEndpoint: pathutil.Join(minioReservedBucketPath, lockServicePath, endpoint.Path),
-				serviceName:     lockServiceName,
-			})
+	seenHosts := set.NewStringSet()
+	for _, endpoint := range endpoints {
+		if seenHosts.Contains(endpoint.Host) {
 			continue
 		}
+		seenHosts.Add(endpoint.Host)
 
-		// Local endpoint
-		if myNode == -1 {
-			myNode = index
+		var locker dsync.NetLocker
+		if endpoint.IsLocal {
+			myNode = len(clnts)
+
+			receiver := &lockRPCReceiver{
+				ll: localLocker{
+					serverAddr:      endpoint.Host,
+					serviceEndpoint: lockServicePath,
+					lockMap:         make(map[string][]lockRequesterInfo),
+				},
+			}
+
+			globalLockServer = receiver
+			locker = &(receiver.ll)
+		} else {
+			host, err := xnet.ParseHost(endpoint.Host)
+			logger.FatalIf(err, "Unable to parse Lock RPC Host", context.Background())
+			locker, err = NewLockRPCClient(host)
+			logger.FatalIf(err, "Unable to initialize Lock RPC Client", context.Background())
 		}
-		// For a local endpoint, setup a local lock server to
-		// avoid network requests.
-		localLockServer := lockServer{
-			AuthRPCServer: AuthRPCServer{},
-			ll: localLocker{
-				mutex:           sync.Mutex{},
-				serviceEndpoint: endpoint.Path,
-				serverAddr:      endpoint.Host,
-				lockMap:         make(map[string][]lockRequesterInfo),
-			},
-		}
-		globalLockServers = append(globalLockServers, &localLockServer)
-		clnts[index] = &(localLockServer.ll)
+
+		clnts = append(clnts, locker)
 	}
 
 	return clnts, myNode
 }
 
-// initNSLock - initialize name space lock map.
-func initNSLock(isDistXL bool) {
-	globalNSMutex = &nsLockMap{
+// newNSLock - return a new name space lock map.
+func newNSLock(isDistXL bool) *nsLockMap {
+	nsMutex := nsLockMap{
 		isDistXL: isDistXL,
 		lockMap:  make(map[nsParam]*nsLock),
 		counters: &lockStat{},
@@ -102,7 +107,13 @@ func initNSLock(isDistXL bool) {
 
 	// Initialize nsLockMap with entry for instrumentation information.
 	// Entries of <volume,path> -> stateInfo of locks
-	globalNSMutex.debugLockMap = make(map[nsParam]*debugLockInfoPerVolumePath)
+	nsMutex.debugLockMap = make(map[nsParam]*debugLockInfoPerVolumePath)
+	return &nsMutex
+}
+
+// initNSLock - initialize name space lock map.
+func initNSLock(isDistXL bool) {
+	globalNSMutex = newNSLock(isDistXL)
 }
 
 // nsParam - carries name space resource.
@@ -141,7 +152,7 @@ func (n *nsLockMap) lock(volume, path string, lockSource, opsID string, readLock
 		nsLk = &nsLock{
 			RWLockerSync: func() RWLockerSync {
 				if n.isDistXL {
-					return dsync.NewDRWMutex(pathJoin(volume, path))
+					return dsync.NewDRWMutex(pathJoin(volume, path), globalDsync)
 				}
 				return &lsync.LRWMutex{}
 			}(),
@@ -155,9 +166,7 @@ func (n *nsLockMap) lock(volume, path string, lockSource, opsID string, readLock
 	// pair of <volume, path> and <OperationID> till the lock
 	// unblocks. The lock for accessing `globalNSMutex` is held inside
 	// the function itself.
-	if err := n.statusNoneToBlocked(param, lockSource, opsID, readLock); err != nil {
-		errorIf(err, fmt.Sprintf("Failed to set lock state to blocked (param = %v; opsID = %s)", param, opsID))
-	}
+	n.statusNoneToBlocked(param, lockSource, opsID, readLock)
 
 	// Unlock map before Locking NS which might block.
 	n.lockMapMutex.Unlock()
@@ -173,26 +182,19 @@ func (n *nsLockMap) lock(volume, path string, lockSource, opsID string, readLock
 		n.lockMapMutex.Lock()
 		defer n.lockMapMutex.Unlock()
 		// Changing the status of the operation from blocked to none
-		if err := n.statusBlockedToNone(param, lockSource, opsID, readLock); err != nil {
-			errorIf(err, fmt.Sprintf("Failed to clear the lock state (param = %v; opsID = %s)", param, opsID))
-		}
+		n.statusBlockedToNone(param, lockSource, opsID, readLock)
 
 		nsLk.ref-- // Decrement ref count since we failed to get the lock
 		// delete the lock state entry for given operation ID.
-		err := n.deleteLockInfoEntryForOps(param, opsID)
-		if err != nil {
-			errorIf(err, fmt.Sprintf("Failed to delete lock info entry (param = %v; opsID = %s)", param, opsID))
-		}
+		n.deleteLockInfoEntryForOps(param, opsID)
+
 		if nsLk.ref == 0 {
 			// Remove from the map if there are no more references.
 			delete(n.lockMap, param)
 
 			// delete the lock state entry for given
 			// <volume, path> pair.
-			err := n.deleteLockInfoEntryForVolumePath(param)
-			if err != nil {
-				errorIf(err, fmt.Sprintf("Failed to delete lock info entry (param = %v)", param))
-			}
+			n.deleteLockInfoEntryForVolumePath(param)
 		}
 		return
 	}
@@ -200,9 +202,7 @@ func (n *nsLockMap) lock(volume, path string, lockSource, opsID string, readLock
 	// Changing the status of the operation from blocked to
 	// running.  change the state of the lock to be running (from
 	// blocked) for the given pair of <volume, path> and <OperationID>.
-	if err := n.statusBlockedToRunning(param, lockSource, opsID, readLock); err != nil {
-		errorIf(err, "Failed to set the lock state to running")
-	}
+	n.statusBlockedToRunning(param, lockSource, opsID, readLock)
 	return
 }
 
@@ -221,17 +221,13 @@ func (n *nsLockMap) unlock(volume, path, opsID string, readLock bool) {
 			nsLk.Unlock()
 		}
 		if nsLk.ref == 0 {
-			errorIf(errors.New("Namespace reference count cannot be 0"),
-				"Invalid reference count detected")
+			logger.LogIf(context.Background(), errors.New("Namespace reference count cannot be 0"))
 		}
 		if nsLk.ref != 0 {
 			nsLk.ref--
 
 			// delete the lock state entry for given operation ID.
-			err := n.deleteLockInfoEntryForOps(param, opsID)
-			if err != nil {
-				errorIf(err, "Failed to delete lock info entry")
-			}
+			n.deleteLockInfoEntryForOps(param, opsID)
 		}
 		if nsLk.ref == 0 {
 			// Remove from the map if there are no more references.
@@ -239,10 +235,7 @@ func (n *nsLockMap) unlock(volume, path, opsID string, readLock bool) {
 
 			// delete the lock state entry for given
 			// <volume, path> pair.
-			err := n.deleteLockInfoEntryForVolumePath(param)
-			if err != nil {
-				errorIf(err, "Failed to delete lock info entry")
-			}
+			n.deleteLockInfoEntryForVolumePath(param)
 		}
 	}
 }
@@ -295,7 +288,7 @@ func (n *nsLockMap) ForceUnlock(volume, path string) {
 	//   are blocking can now proceed as normal and any new locks will also
 	//   participate normally.
 	if n.isDistXL { // For distributed mode, broadcast ForceUnlock message.
-		dsync.NewDRWMutex(pathJoin(volume, path)).ForceUnlock()
+		dsync.NewDRWMutex(pathJoin(volume, path), globalDsync).ForceUnlock()
 	}
 
 	param := nsParam{volume, path}
@@ -359,4 +352,19 @@ func (li *lockInstance) GetRLock(timeout *dynamicTimeout) (timedOutErr error) {
 func (li *lockInstance) RUnlock() {
 	readLock := true
 	li.ns.unlock(li.volume, li.path, li.opsID, readLock)
+}
+
+func getSource() string {
+	var funcName string
+	pc, filename, lineNum, ok := runtime.Caller(2)
+	if ok {
+		filename = pathutil.Base(filename)
+		funcName = strings.TrimPrefix(runtime.FuncForPC(pc).Name(),
+			"github.com/minio/minio/cmd.")
+	} else {
+		filename = "<unknown>"
+		lineNum = 0
+	}
+
+	return fmt.Sprintf("[%s:%d:%s()]", filename, lineNum, funcName)
 }

@@ -17,14 +17,18 @@
 package cmd
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
+	"math/rand"
 	"path"
 	"runtime"
 	"strings"
+	"time"
 	"unicode/utf8"
 
-	"github.com/minio/minio/pkg/errors"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/dns"
 	"github.com/skyrings/skyring-common/tools/uuid"
 )
 
@@ -167,19 +171,20 @@ func pathJoin(elem ...string) string {
 func mustGetUUID() string {
 	uuid, err := uuid.New()
 	if err != nil {
-		panic(fmt.Sprintf("Random UUID generation failed. Error: %s", err))
+		logger.CriticalIf(context.Background(), err)
 	}
 
 	return uuid.String()
 }
 
 // Create an s3 compatible MD5sum for complete multipart transaction.
-func getCompleteMultipartMD5(parts []CompletePart) (string, error) {
+func getCompleteMultipartMD5(ctx context.Context, parts []CompletePart) (string, error) {
 	var finalMD5Bytes []byte
 	for _, part := range parts {
 		md5Bytes, err := hex.DecodeString(part.ETag)
 		if err != nil {
-			return "", errors.Trace(err)
+			logger.LogIf(ctx, err)
+			return "", err
 		}
 		finalMD5Bytes = append(finalMD5Bytes, md5Bytes...)
 	}
@@ -273,6 +278,22 @@ func isMinioMetaBucket(bucketName string) bool {
 // Returns true if input bucket is a reserved minio bucket 'minio'.
 func isMinioReservedBucket(bucketName string) bool {
 	return bucketName == minioReservedBucket
+}
+
+// returns a slice of hosts by reading a slice of DNS records
+func getHostsSlice(records []dns.SrvRecord) []string {
+	var hosts []string
+	for _, r := range records {
+		hosts = append(hosts, r.Host)
+	}
+	return hosts
+}
+
+// returns a random host (and corresponding port) from a slice of DNS records
+func getRandomHostPort(records []dns.SrvRecord) (string, int) {
+	rand.Seed(time.Now().Unix())
+	srvRecord := records[rand.Intn(len(records))]
+	return srvRecord.Host, srvRecord.Port
 }
 
 // byBucketName is a collection satisfying sort.Interface.

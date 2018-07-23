@@ -24,7 +24,6 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/minio/minio/pkg/errors"
 	"google.golang.org/api/googleapi"
 
 	miniogo "github.com/minio/minio-go"
@@ -223,13 +222,6 @@ func TestGCSParseProjectID(t *testing.T) {
 	}
 }
 
-func TestGCSPublicURL(t *testing.T) {
-	gcsURL := toGCSPublicURL("bucket", "testing")
-	if gcsURL != "https://storage.googleapis.com/bucket/testing" {
-		t.Errorf(`Expected "https://storage.googleapis.com/bucket/testing", got %s"`, gcsURL)
-	}
-}
-
 func TestGCSToObjectError(t *testing.T) {
 	testCases := []struct {
 		params      []string
@@ -244,14 +236,14 @@ func TestGCSToObjectError(t *testing.T) {
 		},
 		{
 			[]string{"bucket"},
-			errors.Trace(fmt.Errorf("storage: bucket doesn't exist")),
+			fmt.Errorf("storage: bucket doesn't exist"),
 			minio.BucketNotFound{
 				Bucket: "bucket",
 			},
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(fmt.Errorf("storage: object doesn't exist")),
+			fmt.Errorf("storage: object doesn't exist"),
 			minio.ObjectNotFound{
 				Bucket: "bucket",
 				Object: "object",
@@ -259,76 +251,76 @@ func TestGCSToObjectError(t *testing.T) {
 		},
 		{
 			[]string{"bucket", "object", "uploadID"},
-			errors.Trace(fmt.Errorf("storage: object doesn't exist")),
+			fmt.Errorf("storage: object doesn't exist"),
 			minio.InvalidUploadID{
 				UploadID: "uploadID",
 			},
 		},
 		{
 			[]string{},
-			errors.Trace(fmt.Errorf("Unknown error")),
+			fmt.Errorf("Unknown error"),
 			fmt.Errorf("Unknown error"),
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Message: "No list of errors",
-			}),
+			},
 			&googleapi.Error{
 				Message: "No list of errors",
 			},
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason:  "conflict",
 					Message: "You already own this bucket. Please select another name.",
 				}},
-			}),
+			},
 			minio.BucketAlreadyOwnedByYou{
 				Bucket: "bucket",
 			},
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason:  "conflict",
 					Message: "Sorry, that name is not available. Please try a different one.",
 				}},
-			}),
+			},
 			minio.BucketAlreadyExists{
 				Bucket: "bucket",
 			},
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason: "conflict",
 				}},
-			}),
+			},
 			minio.BucketNotEmpty{Bucket: "bucket"},
 		},
 		{
 			[]string{"bucket"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason: "notFound",
 				}},
-			}),
+			},
 			minio.BucketNotFound{
 				Bucket: "bucket",
 			},
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason: "notFound",
 				}},
-			}),
+			},
 			minio.ObjectNotFound{
 				Bucket: "bucket",
 				Object: "object",
@@ -336,22 +328,22 @@ func TestGCSToObjectError(t *testing.T) {
 		},
 		{
 			[]string{"bucket"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason: "invalid",
 				}},
-			}),
+			},
 			minio.BucketNameInvalid{
 				Bucket: "bucket",
 			},
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason: "forbidden",
 				}},
-			}),
+			},
 			minio.PrefixAccessDenied{
 				Bucket: "bucket",
 				Object: "object",
@@ -359,11 +351,11 @@ func TestGCSToObjectError(t *testing.T) {
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason: "keyInvalid",
 				}},
-			}),
+			},
 			minio.PrefixAccessDenied{
 				Bucket: "bucket",
 				Object: "object",
@@ -371,11 +363,11 @@ func TestGCSToObjectError(t *testing.T) {
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason: "required",
 				}},
-			}),
+			},
 			minio.PrefixAccessDenied{
 				Bucket: "bucket",
 				Object: "object",
@@ -383,11 +375,11 @@ func TestGCSToObjectError(t *testing.T) {
 		},
 		{
 			[]string{"bucket", "object"},
-			errors.Trace(&googleapi.Error{
+			&googleapi.Error{
 				Errors: []googleapi.ErrorItem{{
 					Reason: "unknown",
 				}},
-			}),
+			},
 			fmt.Errorf("Unsupported error reason: unknown"),
 		},
 	}

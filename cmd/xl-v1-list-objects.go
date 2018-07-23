@@ -16,39 +16,57 @@
 
 package cmd
 
-import "github.com/minio/minio/pkg/errors"
+import (
+	"context"
+	"sort"
+)
 
 // Returns function "listDir" of the type listDirFunc.
 // isLeaf - is used by listDir function to check if an entry is a leaf or non-leaf entry.
-// disks - used for doing disk.ListDir(). FS passes single disk argument, XL passes a list of disks.
-func listDirFactory(isLeaf isLeafFunc, treeWalkIgnoredErrs []error, disks ...StorageAPI) listDirFunc {
-	// listDir - lists all the entries at a given prefix and given entry in the prefix.
-	listDir := func(bucket, prefixDir, prefixEntry string) (entries []string, delayIsLeaf bool, err error) {
+// disks - used for doing disk.ListDir()
+func listDirFactory(ctx context.Context, isLeaf isLeafFunc, treeWalkIgnoredErrs []error, disks ...StorageAPI) listDirFunc {
+	// Returns sorted merged entries from all the disks.
+	listDir := func(bucket, prefixDir, prefixEntry string) (mergedEntries []string, delayIsLeaf bool, err error) {
 		for _, disk := range disks {
 			if disk == nil {
 				continue
 			}
-			entries, err = disk.ListDir(bucket, prefixDir)
+			var entries []string
+			var newEntries []string
+			entries, err = disk.ListDir(bucket, prefixDir, -1)
 			if err != nil {
 				// For any reason disk was deleted or goes offline, continue
 				// and list from other disks if possible.
-				if errors.IsErrIgnored(err, treeWalkIgnoredErrs...) {
+				if IsErrIgnored(err, treeWalkIgnoredErrs...) {
 					continue
 				}
-				return nil, false, errors.Trace(err)
+				return nil, false, err
 			}
 
-			entries, delayIsLeaf = filterListEntries(bucket, prefixDir, entries, prefixEntry, isLeaf)
-			return entries, delayIsLeaf, nil
+			// Find elements in entries which are not in mergedEntries
+			for _, entry := range entries {
+				idx := sort.SearchStrings(mergedEntries, entry)
+				// if entry is already present in mergedEntries don't add.
+				if idx < len(mergedEntries) && mergedEntries[idx] == entry {
+					continue
+				}
+				newEntries = append(newEntries, entry)
+			}
+
+			if len(newEntries) > 0 {
+				// Merge the entries and sort it.
+				mergedEntries = append(mergedEntries, newEntries...)
+				sort.Strings(mergedEntries)
+			}
 		}
-		// Nothing found in all disks
-		return nil, false, nil
+		mergedEntries, delayIsLeaf = filterListEntries(bucket, prefixDir, mergedEntries, prefixEntry, isLeaf)
+		return mergedEntries, delayIsLeaf, nil
 	}
 	return listDir
 }
 
 // listObjects - wrapper function implemented over file tree walk.
-func (xl xlObjects) listObjects(bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
+func (xl xlObjects) listObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
 	// Default is recursive, if delimiter is set then list non recursive.
 	recursive := true
 	if delimiter == slashSeparator {
@@ -60,14 +78,16 @@ func (xl xlObjects) listObjects(bucket, prefix, marker, delimiter string, maxKey
 	if walkResultCh == nil {
 		endWalkCh = make(chan struct{})
 		isLeaf := xl.isObject
-		listDir := listDirFactory(isLeaf, xlTreeWalkIgnoredErrs, xl.getLoadBalancedDisks()...)
-		walkResultCh = startTreeWalk(bucket, prefix, marker, recursive, listDir, isLeaf, endWalkCh)
+		isLeafDir := xl.isObjectDir
+		listDir := listDirFactory(ctx, isLeaf, xlTreeWalkIgnoredErrs, xl.getLoadBalancedDisks()...)
+		walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, isLeaf, isLeafDir, endWalkCh)
 	}
 
 	var objInfos []ObjectInfo
 	var eof bool
 	var nextMarker string
 	for i := 0; i < maxKeys; {
+
 		walkResult, ok := <-walkResultCh
 		if !ok {
 			// Closed channel.
@@ -88,10 +108,13 @@ func (xl xlObjects) listObjects(bucket, prefix, marker, delimiter string, maxKey
 		} else {
 			// Set the Mode to a "regular" file.
 			var err error
-			objInfo, err = xl.getObjectInfo(bucket, entry)
+			objInfo, err = xl.getObjectInfo(ctx, bucket, entry)
 			if err != nil {
-				// Ignore errFileNotFound
-				if errors.Cause(err) == errFileNotFound {
+				// Ignore errFileNotFound as the object might have got
+				// deleted in the interim period of listing and getObjectInfo(),
+				// ignore quorum error as it might be an entry from an outdated disk.
+				switch err {
+				case errFileNotFound, errXLReadQuorum:
 					continue
 				}
 				return loi, toObjectErr(err, bucket, prefix)
@@ -114,7 +137,7 @@ func (xl xlObjects) listObjects(bucket, prefix, marker, delimiter string, maxKey
 	result := ListObjectsInfo{IsTruncated: !eof}
 	for _, objInfo := range objInfos {
 		result.NextMarker = objInfo.Name
-		if objInfo.IsDir {
+		if objInfo.IsDir && delimiter == slashSeparator {
 			result.Prefixes = append(result.Prefixes, objInfo.Name)
 			continue
 		}
@@ -124,14 +147,22 @@ func (xl xlObjects) listObjects(bucket, prefix, marker, delimiter string, maxKey
 }
 
 // ListObjects - list all objects at prefix, delimited by '/'.
-func (xl xlObjects) ListObjects(bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
-	if err := checkListObjsArgs(bucket, prefix, marker, delimiter, xl); err != nil {
+func (xl xlObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
+	if err := checkListObjsArgs(ctx, bucket, prefix, marker, delimiter, xl); err != nil {
 		return loi, err
 	}
 
 	// With max keys of zero we have reached eof, return right here.
 	if maxKeys == 0 {
 		return loi, nil
+	}
+
+	// Marker is set validate pre-condition.
+	if marker != "" {
+		// Marker not common with prefix is not implemented.Send an empty response
+		if !hasPrefix(marker, prefix) {
+			return ListObjectsInfo{}, e
+		}
 	}
 
 	// For delimiter and prefix as '/' we do not list anything at all
@@ -148,7 +179,7 @@ func (xl xlObjects) ListObjects(bucket, prefix, marker, delimiter string, maxKey
 	}
 
 	// Initiate a list operation, if successful filter and return quickly.
-	listObjInfo, err := xl.listObjects(bucket, prefix, marker, delimiter, maxKeys)
+	listObjInfo, err := xl.listObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
 	if err == nil {
 		// We got the entries successfully return.
 		return listObjInfo, nil
