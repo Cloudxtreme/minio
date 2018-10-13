@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/build"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -46,6 +47,11 @@ const (
 )
 
 const loggerTimeFormat string = "15:04:05 MST 01/02/2006"
+
+// List of error strings to be ignored by LogIf
+const (
+	diskNotFoundError = "disk not found"
+)
 
 var matchingFuncNames = [...]string{
 	"http.HandlerFunc.ServeHTTP",
@@ -94,13 +100,14 @@ type Console interface {
 }
 
 func consoleLog(console Console, msg string, args ...interface{}) {
-	if jsonFlag {
+	switch {
+	case jsonFlag:
 		// Strip escape control characters from json message
 		msg = ansiRE.ReplaceAllLiteralString(msg, "")
 		console.json(msg, args...)
-	} else if quiet {
+	case quiet:
 		console.quiet(msg, args...)
-	} else {
+	default:
 		console.pretty(msg, args...)
 	}
 }
@@ -266,14 +273,33 @@ func getTrace(traceLevel int) []string {
 	return trace
 }
 
-// LogIf prints a detailed error message during
+// LogAlwaysIf prints a detailed error message during
 // the execution of the server.
-func LogIf(ctx context.Context, err error) {
-	if Disable {
+func LogAlwaysIf(ctx context.Context, err error) {
+	if err == nil {
 		return
 	}
 
+	logIf(ctx, err)
+}
+
+// LogIf prints a detailed error message during
+// the execution of the server, if it is not an
+// ignored error.
+func LogIf(ctx context.Context, err error) {
 	if err == nil {
+		return
+	}
+
+	if err.Error() != diskNotFoundError {
+		logIf(ctx, err)
+	}
+}
+
+// logIf prints a detailed error message during
+// the execution of the server.
+func logIf(ctx context.Context, err error) {
+	if Disable {
 		return
 	}
 
@@ -313,6 +339,55 @@ func LogIf(ctx context.Context, err error) {
 	// Iterate over all logger targets to send the log entry
 	for _, t := range Targets {
 		t.send(entry)
+	}
+}
+
+type auditEntry struct {
+	DeploymentID string            `json:"deploymentid,omitempty"`
+	Time         string            `json:"time"`
+	API          *api              `json:"api,omitempty"`
+	RemoteHost   string            `json:"remotehost,omitempty"`
+	RequestID    string            `json:"requestID,omitempty"`
+	UserAgent    string            `json:"userAgent,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+}
+
+// AuditLog - logs audit logs to all targets.
+func AuditLog(ctx context.Context, r *http.Request) {
+	if Disable {
+		return
+	}
+
+	req := GetReqInfo(ctx)
+	if req == nil {
+		req = &ReqInfo{API: "SYSTEM"}
+	}
+
+	API := "SYSTEM"
+	if req.API != "" {
+		API = req.API
+	}
+
+	tags := make(map[string]string)
+	for _, entry := range req.GetTags() {
+		tags[entry.Key] = entry.Val
+	}
+
+	entry := auditEntry{
+		DeploymentID: deploymentID,
+		RemoteHost:   req.RemoteHost,
+		RequestID:    req.RequestID,
+		UserAgent:    req.UserAgent,
+		Time:         time.Now().UTC().Format(time.RFC3339Nano),
+		API:          &api{Name: API, Args: &args{Bucket: req.BucketName, Object: req.ObjectName}},
+		Metadata:     tags,
+	}
+
+	// Send audit logs only to http targets.
+	for _, t := range Targets {
+		if _, ok := t.(*HTTPTarget); ok {
+			t.send(entry)
+		}
 	}
 }
 
@@ -425,10 +500,9 @@ func (f fatalMsg) pretty(msg string, args ...interface{}) {
 	os.Exit(1)
 }
 
-var info infoMsg
+type infoMsg struct{}
 
-type infoMsg struct {
-}
+var info infoMsg
 
 func (i infoMsg) json(msg string, args ...interface{}) {
 	logJSON, err := json.Marshal(&logEntry{

@@ -50,6 +50,9 @@ var errRPCAPIVersionUnsupported = errors.New("Unsupported rpc API version")
 // errServerTimeMismatch - server times are too far apart.
 var errServerTimeMismatch = errors.New("Server times are too far apart")
 
+// errOperationTimedOut
+var errOperationTimedOut = errors.New("Operation timed out")
+
 // errInvalidBucketName - bucket name is reserved for Minio, usually
 // returned for 'minio', '.minio.sys', buckets with capital letters.
 var errInvalidBucketName = errors.New("The specified bucket is not valid")
@@ -70,3 +73,6 @@ var errFirstDiskWait = errors.New("Waiting on other disks")
 
 // error returned when a bucket already exists
 var errBucketAlreadyExists = errors.New("Your previous request to create the named bucket succeeded and you already own it")
+
+// error returned for a negative actual size.
+var errInvalidDecompressedSize = errors.New("Invalid Decompressed Size")

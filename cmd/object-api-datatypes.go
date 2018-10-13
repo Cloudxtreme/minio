@@ -31,9 +31,9 @@ type BackendType int
 const (
 	Unknown BackendType = iota
 	// Filesystem backend.
-	FS
-	// Multi disk Erasure (single, distributed) backend.
-	Erasure
+	BackendFS
+	// Multi disk BackendErasure (single, distributed) backend.
+	BackendErasure
 	// Add your own backend.
 )
 
@@ -258,6 +258,9 @@ type PartInfo struct {
 
 	// Size in bytes of the part.
 	Size int64
+
+	// Decompressed Size.
+	ActualSize int64
 }
 
 // MultipartInfo - represents metadata in progress multipart upload.

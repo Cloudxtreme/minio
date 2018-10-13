@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"context"
 	"errors"
 	"net"
 	"os"
@@ -27,13 +26,13 @@ import (
 	"time"
 
 	etcd "github.com/coreos/etcd/clientv3"
-
+	dns2 "github.com/miekg/dns"
 	"github.com/minio/cli"
+	"github.com/minio/minio-go/pkg/set"
+	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/dns"
-
-	"github.com/minio/minio-go/pkg/set"
 )
 
 // Check for updates and print a notification message
@@ -48,45 +47,19 @@ func checkUpdate(mode string) {
 	}
 }
 
-// Initialize and load config from remote etcd or local config directory
-func initConfig() {
-	if globalEtcdClient != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		resp, err := globalEtcdClient.Get(ctx, getConfigFile())
-		cancel()
-		// This means there are no entries in etcd with config file
-		// So create a new config
-		if err == nil && resp.Count == 0 {
-			logger.FatalIf(newConfig(), "Unable to initialize minio config for the first time.")
-			logger.Info("Created minio configuration file successfully at %v", globalEtcdClient.Endpoints())
-		} else {
-			// This means there is an entry in etcd, update it if required and proceed
-			if err == nil && resp.Count > 0 {
-				logger.FatalIf(migrateConfig(), "Config migration failed.")
-				logger.FatalIf(loadConfig(), "Unable to load config version: '%s'.", serverConfigVersion)
-			} else {
-				logger.FatalIf(err, "Unable to load config version: '%s'.", serverConfigVersion)
-			}
-		}
+// Load logger targets based on user's configuration
+func loadLoggers() {
+	if endpoint, ok := os.LookupEnv("MINIO_LOGGER_HTTP_ENDPOINT"); ok {
+		// Enable http logging through ENV, this is specifically added gateway audit logging.
+		logger.AddTarget(logger.NewHTTP(endpoint, NewCustomHTTPTransport()))
 		return
 	}
 
-	if isFile(getConfigFile()) {
-		logger.FatalIf(migrateConfig(), "Config migration failed")
-		logger.FatalIf(loadConfig(), "Unable to load the configuration file")
-	} else {
-		// Config file does not exist, we create it fresh and return upon success.
-		logger.FatalIf(newConfig(), "Unable to initialize minio config for the first time")
-		logger.Info("Created minio configuration file successfully at " + getConfigDir())
-	}
-}
-
-// Load logger targets based on user's configuration
-func loadLoggers() {
 	if globalServerConfig.Logger.Console.Enabled {
 		// Enable console logging
 		logger.AddTarget(logger.NewConsole())
 	}
+
 	for _, l := range globalServerConfig.Logger.HTTP {
 		if l.Enabled {
 			// Enable http logging
@@ -99,9 +72,10 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 
 	var configDir string
 
-	if ctx.IsSet("config-dir") {
+	switch {
+	case ctx.IsSet("config-dir"):
 		configDir = ctx.String("config-dir")
-	} else if ctx.GlobalIsSet("config-dir") {
+	case ctx.GlobalIsSet("config-dir"):
 		configDir = ctx.GlobalString("config-dir")
 		// cli package does not expose parent's "config-dir" option.  Below code is workaround.
 		if configDir == "" || configDir == getConfigDir() {
@@ -109,7 +83,7 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 				configDir = ctx.Parent().GlobalString("config-dir")
 			}
 		}
-	} else {
+	default:
 		// Neither local nor global config-dir option is provided.  In this case, try to use
 		// default config directory.
 		configDir = getConfigDir()
@@ -128,10 +102,23 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 	setConfigDir(configDirAbs)
 }
 
+// Parses the given compression exclude list `extensions` or `content-types`.
+func parseCompressIncludes(includes []string) ([]string, error) {
+	for _, e := range includes {
+		if len(e) == 0 {
+			return nil, uiErrInvalidCompressionIncludesValue(nil).Msg("extension/mime-type (%s) cannot be empty", e)
+		}
+	}
+	return includes, nil
+}
+
 func handleCommonEnvVars() {
+	compressEnvDelimiter := ","
 	// Start profiler if env is set.
 	if profiler := os.Getenv("_MINIO_PROFILER"); profiler != "" {
-		globalProfiler = startProfiler(profiler)
+		var err error
+		globalProfiler, err = startProfiler(profiler, "")
+		logger.FatalIf(err, "Unable to setup a profiler")
 	}
 
 	accessKey := os.Getenv("MINIO_ACCESS_KEY")
@@ -141,6 +128,7 @@ func handleCommonEnvVars() {
 		if err != nil {
 			logger.Fatal(uiErrInvalidCredentials(err), "Unable to validate credentials inherited from the shell environment")
 		}
+		cred.Expiration = timeSentinel
 
 		// credential Envs are set globally.
 		globalIsEnvCreds = true
@@ -150,7 +138,7 @@ func handleCommonEnvVars() {
 	if browser := os.Getenv("MINIO_BROWSER"); browser != "" {
 		browserFlag, err := ParseBoolFlag(browser)
 		if err != nil {
-			logger.Fatal(uiErrInvalidBrowserValue(nil).Msg("Unknown value `%s`", browser), "Unable to validate MINIO_BROWSER environment variable")
+			logger.Fatal(uiErrInvalidBrowserValue(nil).Msg("Unknown value `%s`", browser), "Invalid MINIO_BROWSER value in environment variable")
 		}
 
 		// browser Envs are set globally, this does not represent
@@ -179,6 +167,11 @@ func handleCommonEnvVars() {
 	}
 
 	globalDomainName, globalIsEnvDomainName = os.LookupEnv("MINIO_DOMAIN")
+	if globalDomainName != "" {
+		if _, ok = dns2.IsDomainName(globalDomainName); !ok {
+			logger.Fatal(uiErrInvalidDomainValue(nil).Msg("Unknown value `%s`", globalDomainName), "Invalid MINIO_DOMAIN value in environment variable")
+		}
+	}
 
 	minioEndpointsEnv, ok := os.LookupEnv("MINIO_PUBLIC_IPS")
 	if ok {
@@ -271,12 +264,50 @@ func handleCommonEnvVars() {
 	if worm := os.Getenv("MINIO_WORM"); worm != "" {
 		wormFlag, err := ParseBoolFlag(worm)
 		if err != nil {
-			logger.Fatal(uiErrInvalidWormValue(nil).Msg("Unknown value `%s`", worm), "Unable to validate MINIO_WORM environment variable")
+			logger.Fatal(uiErrInvalidWormValue(nil).Msg("Unknown value `%s`", worm), "Invalid MINIO_WORM value in environment variable")
 		}
 
 		// worm Envs are set globally, this does not represent
 		// if worm is turned off or on.
 		globalIsEnvWORM = true
 		globalWORMEnabled = bool(wormFlag)
+	}
+
+	kmsConf, err := crypto.NewVaultConfig()
+	if err != nil {
+		logger.Fatal(err, "Unable to initialize hashicorp vault")
+	}
+	if kmsConf.Vault.Endpoint != "" {
+		kms, err := crypto.NewVault(kmsConf)
+		if err != nil {
+			logger.Fatal(err, "Unable to initialize KMS")
+		}
+		globalKMS = kms
+		globalKMSKeyID = kmsConf.Vault.Key.Name
+		globalKMSConfig = kmsConf
+	}
+
+	if compress := os.Getenv("MINIO_COMPRESS"); compress != "" {
+		globalIsCompressionEnabled = strings.EqualFold(compress, "true")
+	}
+
+	compressExtensions := os.Getenv("MINIO_COMPRESS_EXTENSIONS")
+	compressMimeTypes := os.Getenv("MINIO_COMPRESS_MIMETYPES")
+	if compressExtensions != "" || compressMimeTypes != "" {
+		globalIsEnvCompression = true
+		if compressExtensions != "" {
+			extensions, err := parseCompressIncludes(strings.Split(compressExtensions, compressEnvDelimiter))
+			if err != nil {
+				logger.Fatal(err, "Invalid MINIO_COMPRESS_EXTENSIONS value (`%s`)", extensions)
+			}
+			globalCompressExtensions = extensions
+		}
+		if compressMimeTypes != "" {
+			contenttypes, err := parseCompressIncludes(strings.Split(compressMimeTypes, compressEnvDelimiter))
+			if err != nil {
+				logger.Fatal(err, "Invalid MINIO_COMPRESS_MIMETYPES value (`%s`)", contenttypes)
+			}
+			globalCompressMimeTypes = contenttypes
+		}
 	}
 }

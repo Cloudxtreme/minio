@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"context"
-	"time"
 
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/hash"
@@ -36,19 +35,19 @@ func (a GatewayUnsupported) ListMultipartUploads(ctx context.Context, bucket str
 }
 
 // NewMultipartUpload upload object in multiple parts
-func (a GatewayUnsupported) NewMultipartUpload(ctx context.Context, bucket string, object string, metadata map[string]string) (uploadID string, err error) {
+func (a GatewayUnsupported) NewMultipartUpload(ctx context.Context, bucket string, object string, metadata map[string]string, opts ObjectOptions) (uploadID string, err error) {
 	logger.LogIf(ctx, NotImplemented{})
 	return "", NotImplemented{}
 }
 
 // CopyObjectPart copy part of object to uploadID for another object
-func (a GatewayUnsupported) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject, uploadID string, partID int, startOffset, length int64, srcInfo ObjectInfo) (pi PartInfo, err error) {
+func (a GatewayUnsupported) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject, uploadID string, partID int, startOffset, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (pi PartInfo, err error) {
 	logger.LogIf(ctx, NotImplemented{})
 	return pi, NotImplemented{}
 }
 
 // PutObjectPart puts a part of object in bucket
-func (a GatewayUnsupported) PutObjectPart(ctx context.Context, bucket string, object string, uploadID string, partID int, data *hash.Reader) (pi PartInfo, err error) {
+func (a GatewayUnsupported) PutObjectPart(ctx context.Context, bucket string, object string, uploadID string, partID int, data *hash.Reader, opts ObjectOptions) (pi PartInfo, err error) {
 	logger.LogIf(ctx, NotImplemented{})
 	return pi, NotImplemented{}
 }
@@ -132,23 +131,9 @@ func (a GatewayUnsupported) ListObjectsHeal(ctx context.Context, bucket, prefix,
 
 // CopyObject copies a blob from source container to destination container.
 func (a GatewayUnsupported) CopyObject(ctx context.Context, srcBucket string, srcObject string, destBucket string, destObject string,
-	srcInfo ObjectInfo) (objInfo ObjectInfo, err error) {
+	srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error) {
 	logger.LogIf(ctx, NotImplemented{})
 	return objInfo, NotImplemented{}
-}
-
-// Locking operations
-
-// ListLocks lists namespace locks held in object layer
-func (a GatewayUnsupported) ListLocks(ctx context.Context, bucket, prefix string, duration time.Duration) ([]VolumeLockInfo, error) {
-	logger.LogIf(ctx, NotImplemented{})
-	return []VolumeLockInfo{}, NotImplemented{}
-}
-
-// ClearLocks clears namespace locks held in object layer
-func (a GatewayUnsupported) ClearLocks(ctx context.Context, info []VolumeLockInfo) error {
-	logger.LogIf(ctx, NotImplemented{})
-	return NotImplemented{}
 }
 
 // RefreshBucketPolicy refreshes cache policy with what's on disk.
@@ -164,5 +149,10 @@ func (a GatewayUnsupported) IsNotificationSupported() bool {
 
 // IsEncryptionSupported returns whether server side encryption is applicable for this layer.
 func (a GatewayUnsupported) IsEncryptionSupported() bool {
+	return false
+}
+
+// IsCompressionSupported returns whether compression is applicable for this layer.
+func (a GatewayUnsupported) IsCompressionSupported() bool {
 	return false
 }

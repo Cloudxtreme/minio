@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"path"
 
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/ioutil"
@@ -25,6 +27,11 @@ import (
 )
 
 const (
+	// SSEMultipart is the metadata key indicating that the object
+	// was uploaded using the S3 multipart API and stored using
+	// some from of server-side-encryption.
+	SSEMultipart = "X-Minio-Internal-Encrypted-Multipart"
+
 	// SSEIV is the metadata key referencing the random initialization
 	// vector (IV) used for SSE-S3 and SSE-C key derivation.
 	SSEIV = "X-Minio-Internal-Server-Side-Encryption-Iv"
@@ -33,8 +40,8 @@ const (
 	// used by SSE-C and SSE-S3 to encrypt the object.
 	SSESealAlgorithm = "X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm"
 
-	// SSECSealKey is the metadata key referencing the sealed object-key for SSE-C.
-	SSECSealKey = "X-Minio-Internal-Server-Side-Encryption-Sealed-Key"
+	// SSECSealedKey is the metadata key referencing the sealed object-key for SSE-C.
+	SSECSealedKey = "X-Minio-Internal-Server-Side-Encryption-Sealed-Key"
 
 	// S3SealedKey is the metadata key referencing the sealed object-key for SSE-S3.
 	S3SealedKey = "X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key"
@@ -59,6 +66,63 @@ const (
 	// is not optimal. See: https://github.com/minio/minio/pull/6121
 	InsecureSealAlgorithm = "DARE-SHA256"
 )
+
+// String returns the SSE domain as string. For SSE-S3 the
+// domain is "SSE-S3".
+func (s3) String() string { return "SSE-S3" }
+
+// UnsealObjectKey extracts and decrypts the sealed object key
+// from the metadata using KMS and returns the decrypted object
+// key.
+func (sse s3) UnsealObjectKey(kms KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	keyID, kmsKey, sealedKey, err := sse.ParseMetadata(metadata)
+	if err != nil {
+		return
+	}
+	unsealKey, err := kms.UnsealKey(keyID, kmsKey, Context{bucket: path.Join(bucket, object)})
+	if err != nil {
+		return
+	}
+	err = key.Unseal(unsealKey, sealedKey, sse.String(), bucket, object)
+	return
+}
+
+// String returns the SSE domain as string. For SSE-C the
+// domain is "SSE-C".
+func (ssec) String() string { return "SSE-C" }
+
+// UnsealObjectKey extracts and decrypts the sealed object key
+// from the metadata using the SSE-C client key of the HTTP headers
+// and returns the decrypted object key.
+func (sse ssec) UnsealObjectKey(h http.Header, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	clientKey, err := sse.ParseHTTP(h)
+	if err != nil {
+		return
+	}
+	return unsealObjectKey(clientKey, metadata, bucket, object)
+}
+
+// UnsealObjectKey extracts and decrypts the sealed object key
+// from the metadata using the SSE-Copy client key of the HTTP headers
+// and returns the decrypted object key.
+func (sse ssecCopy) UnsealObjectKey(h http.Header, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	clientKey, err := sse.ParseHTTP(h)
+	if err != nil {
+		return
+	}
+	return unsealObjectKey(clientKey, metadata, bucket, object)
+}
+
+// unsealObjectKey decrypts and returns the sealed object key
+// from the metadata using the SSE-C client key.
+func unsealObjectKey(clientKey [32]byte, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	sealedKey, err := SSEC.ParseMetadata(metadata)
+	if err != nil {
+		return
+	}
+	err = key.Unseal(clientKey, sealedKey, SSEC.String(), bucket, object)
+	return
+}
 
 // EncryptSinglePart encrypts an io.Reader which must be the
 // the body of a single-part PUT request.
