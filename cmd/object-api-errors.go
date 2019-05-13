@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"path"
 )
 
 // Converts underlying storage error. Convenience function written to
@@ -26,6 +27,22 @@ import (
 // underlying storage layer.
 func toObjectErr(err error, params ...string) error {
 	switch err {
+	case errDiskNotFound:
+		switch len(params) {
+		case 1:
+			err = BucketNotFound{Bucket: params[0]}
+		case 2:
+			err = ObjectNotFound{
+				Bucket: params[0],
+				Object: params[1],
+			}
+		case 3:
+			err = InvalidUploadID{
+				Bucket:   params[0],
+				Object:   params[1],
+				UploadID: params[2],
+			}
+		}
 	case errVolumeNotFound:
 		if len(params) >= 1 {
 			err = BucketNotFound{Bucket: params[0]}
@@ -40,6 +57,8 @@ func toObjectErr(err error, params ...string) error {
 		}
 	case errDiskFull:
 		err = StorageFull{}
+	case errTooManyOpenFiles:
+		err = SlowDown{}
 	case errFileAccessDenied:
 		if len(params) >= 2 {
 			err = PrefixAccessDenied{
@@ -47,7 +66,14 @@ func toObjectErr(err error, params ...string) error {
 				Object: params[1],
 			}
 		}
-	case errIsNotRegular, errFileAccessDenied:
+	case errFileParentIsFile:
+		if len(params) >= 2 {
+			err = ParentIsObject{
+				Bucket: params[0],
+				Object: params[1],
+			}
+		}
+	case errIsNotRegular:
 		if len(params) >= 2 {
 			err = ObjectExistsAsDirectory{
 				Bucket: params[0],
@@ -55,10 +81,17 @@ func toObjectErr(err error, params ...string) error {
 			}
 		}
 	case errFileNotFound:
-		if len(params) >= 2 {
+		switch len(params) {
+		case 2:
 			err = ObjectNotFound{
 				Bucket: params[0],
 				Object: params[1],
+			}
+		case 3:
+			err = InvalidUploadID{
+				Bucket:   params[0],
+				Object:   params[1],
+				UploadID: params[2],
 			}
 		}
 	case errFileNameTooLong:
@@ -104,6 +137,13 @@ type StorageFull struct{}
 
 func (e StorageFull) Error() string {
 	return "Storage reached its minimum free disk threshold."
+}
+
+// SlowDown  too many file descriptors open or backend busy .
+type SlowDown struct{}
+
+func (e SlowDown) Error() string {
+	return "Please reduce your request rate"
 }
 
 // InsufficientReadQuorum storage cannot satisfy quorum for read operation.
@@ -180,6 +220,13 @@ type PrefixAccessDenied GenericError
 
 func (e PrefixAccessDenied) Error() string {
 	return "Prefix access is denied: " + e.Bucket + "/" + e.Object
+}
+
+// ParentIsObject object access is denied.
+type ParentIsObject GenericError
+
+func (e ParentIsObject) Error() string {
+	return "Parent is object " + e.Bucket + "/" + path.Dir(e.Object)
 }
 
 // BucketExists bucket exists.
@@ -306,6 +353,8 @@ func (e MalformedUploadID) Error() string {
 
 // InvalidUploadID invalid upload id.
 type InvalidUploadID struct {
+	Bucket   string
+	Object   string
 	UploadID string
 }
 
@@ -357,13 +406,6 @@ func (e NotImplemented) Error() string {
 	return "Not Implemented"
 }
 
-// PolicyNesting - policy nesting conflict.
-type PolicyNesting struct{}
-
-func (e PolicyNesting) Error() string {
-	return "New bucket policy conflicts with an existing policy. Please try again with new prefix."
-}
-
 // UnsupportedMetadata - unsupported metadata
 type UnsupportedMetadata struct{}
 
@@ -381,5 +423,17 @@ func (e BackendDown) Error() string {
 // isErrObjectNotFound - Check if error type is ObjectNotFound.
 func isErrObjectNotFound(err error) bool {
 	_, ok := err.(ObjectNotFound)
+	return ok
+}
+
+// PreConditionFailed - Check if copy precondition failed
+type PreConditionFailed struct{}
+
+func (e PreConditionFailed) Error() string {
+	return "At least one of the pre-conditions you specified did not hold"
+}
+
+func isErrPreconditionFailed(err error) bool {
+	_, ok := err.(PreConditionFailed)
 	return ok
 }

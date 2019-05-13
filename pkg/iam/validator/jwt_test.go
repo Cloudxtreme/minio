@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,10 +44,10 @@ func TestJWT(t *testing.T) {
 		t.Fatalf("Expected 1 keys, got %d", len(jk.Keys))
 	}
 
-	keys := make([]crypto.PublicKey, len(jk.Keys))
+	keys := make(map[string]crypto.PublicKey, len(jk.Keys))
 	for ii, jks := range jk.Keys {
 		var err error
-		keys[ii], err = jks.DecodePublicKey()
+		keys[jks.Kid], err = jks.DecodePublicKey()
 		if err != nil {
 			t.Fatalf("Failed to decode key %d: %v", ii, err)
 		}
@@ -59,8 +59,8 @@ func TestJWT(t *testing.T) {
 	}
 
 	jwt := NewJWT(JWKSArgs{
-		URL:       u1,
-		publicKey: keys[0],
+		URL:        u1,
+		publicKeys: keys,
 	})
 	if jwt.ID() != "jwt" {
 		t.Fatalf("Uexpected id %s for the validator", jwt.ID())
@@ -108,7 +108,7 @@ func TestDefaultExpiryDuration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d, err := getDefaultExpiration(u.Query().Get("DurationSeconds"))
+		d, err := GetDefaultExpiration(u.Query().Get("DurationSeconds"))
 		gotErr := (err != nil)
 		if testCase.expectErr != gotErr {
 			t.Errorf("Test %d: Expected %v, got %v with error %s", i+1, testCase.expectErr, gotErr, err)

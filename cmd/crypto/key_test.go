@@ -1,4 +1,4 @@
-// Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
+// MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -163,6 +163,34 @@ func TestDerivePartKey(t *testing.T) {
 		partKey := key.DerivePartKey(test.PartID)
 		if !bytes.Equal(partKey[:], expectedPartKey[:]) {
 			t.Errorf("Test %d derives wrong part-key: got '%s' want: '%s'", i, hex.EncodeToString(partKey[:]), test.PartKey)
+		}
+	}
+}
+
+var sealUnsealETagTests = []string{
+	"",
+	"90682b8e8cc7609c",
+	"90682b8e8cc7609c4671e1d64c73fc30",
+	"90682b8e8cc7609c4671e1d64c73fc307fb3104f",
+}
+
+func TestSealETag(t *testing.T) {
+	var key ObjectKey
+	for i := range key {
+		key[i] = byte(i)
+	}
+	for i, etag := range sealUnsealETagTests {
+		tag, err := hex.DecodeString(etag)
+		if err != nil {
+			t.Errorf("Test %d: failed to decode etag: %s", i, err)
+		}
+		sealedETag := key.SealETag(tag)
+		unsealedETag, err := key.UnsealETag(sealedETag)
+		if err != nil {
+			t.Errorf("Test %d: failed to decrypt etag: %s", i, err)
+		}
+		if !bytes.Equal(unsealedETag, tag) {
+			t.Errorf("Test %d: unsealed etag does not match: got %s - want %s", i, hex.EncodeToString(unsealedETag), etag)
 		}
 	}
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -206,6 +206,9 @@ func osErrToFSFileErr(err error) error {
 	if isSysErrPathNotFound(err) {
 		return errFileNotFound
 	}
+	if isSysErrTooManyFiles(err) {
+		return errTooManyOpenFiles
+	}
 	return err
 }
 
@@ -294,7 +297,7 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 
 	// Seek to the requested offset.
 	if offset > 0 {
-		_, err = fr.Seek(offset, os.SEEK_SET)
+		_, err = fr.Seek(offset, io.SeekStart)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			return nil, 0, err

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -156,7 +156,10 @@ func TestListObjectsV1Resources(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		prefix, marker, delimiter, maxKeys, encodingType := getListObjectsV1Args(testCase.values)
+		prefix, marker, delimiter, maxKeys, encodingType, argsErr := getListObjectsV1Args(testCase.values)
+		if argsErr != ErrNone {
+			t.Errorf("Test %d: argument parsing failed, got %v", i+1, argsErr)
+		}
 		if prefix != testCase.prefix {
 			t.Errorf("Test %d: Expected %s, got %s", i+1, testCase.prefix, prefix)
 		}
@@ -198,7 +201,10 @@ func TestGetObjectsResources(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		uploadID, partNumberMarker, maxParts, encodingType := getObjectResources(testCase.values)
+		uploadID, partNumberMarker, maxParts, encodingType, argsErr := getObjectResources(testCase.values)
+		if argsErr != ErrNone {
+			t.Errorf("Test %d: argument parsing failed, got %v", i+1, argsErr)
+		}
 		if uploadID != testCase.uploadID {
 			t.Errorf("Test %d: Expected %s, got %s", i+1, testCase.uploadID, uploadID)
 		}

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/xml"
@@ -1046,7 +1045,8 @@ func (s *TestSuiteCommon) TestPutBucket(c *check) {
 			client := http.Client{Transport: s.transport}
 			response, err := client.Do(request)
 			if err != nil {
-				c.Fatalf("Put bucket Failed: <ERROR> %s", err)
+				c.Errorf("Put bucket Failed: <ERROR> %s", err)
+				return
 			}
 			defer response.Body.Close()
 		}()
@@ -1657,62 +1657,58 @@ func (s *TestSuiteCommon) TestListObjectsHandler(c *check) {
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	buffer1 := bytes.NewReader([]byte("Hello World"))
-	request, err = newTestSignedRequest("PUT", getPutObjectURL(s.endPoint, bucketName, "bar"),
-		int64(buffer1.Len()), buffer1, s.accessKey, s.secretKey, s.signer)
-	c.Assert(err, nil)
+	for _, objectName := range []string{"foo bar 1", "foo bar 2"} {
+		buffer := bytes.NewReader([]byte("Hello World"))
+		request, err = newTestSignedRequest("PUT", getPutObjectURL(s.endPoint, bucketName, objectName),
+			int64(buffer.Len()), buffer, s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
 
-	client = http.Client{Transport: s.transport}
-	response, err = client.Do(request)
-	c.Assert(err, nil)
-	c.Assert(response.StatusCode, http.StatusOK)
+		client = http.Client{Transport: s.transport}
+		response, err = client.Do(request)
+		c.Assert(err, nil)
+		c.Assert(response.StatusCode, http.StatusOK)
+	}
 
-	// create listObjectsV1 request with valid parameters
-	request, err = newTestSignedRequest("GET", getListObjectsV1URL(s.endPoint, bucketName, "1000"),
-		0, nil, s.accessKey, s.secretKey, s.signer)
-	c.Assert(err, nil)
-	client = http.Client{Transport: s.transport}
-	// execute the HTTP request.
-	response, err = client.Do(request)
-	c.Assert(err, nil)
-	c.Assert(response.StatusCode, http.StatusOK)
+	var testCases = []struct {
+		getURL          string
+		expectedStrings []string
+	}{
+		{getListObjectsV1URL(s.endPoint, bucketName, "", "1000", ""), []string{"<Key>foo bar 1</Key>", "<Key>foo bar 2</Key>"}},
+		{getListObjectsV1URL(s.endPoint, bucketName, "", "1000", "url"), []string{"<Key>foo+bar+1</Key>", "<Key>foo+bar+2</Key>"}},
+		{getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "", ""),
+			[]string{
+				"<Key>foo bar 1</Key>",
+				"<Key>foo bar 2</Key>",
+				"<Owner><ID></ID><DisplayName></DisplayName></Owner>",
+			},
+		},
+		{getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "true", ""),
+			[]string{
+				"<Key>foo bar 1</Key>",
+				"<Key>foo bar 2</Key>",
+				fmt.Sprintf("<Owner><ID>%s</ID><DisplayName></DisplayName></Owner>", globalMinioDefaultOwnerID),
+			},
+		},
+		{getListObjectsV2URL(s.endPoint, bucketName, "", "1000", "", "url"), []string{"<Key>foo+bar+1</Key>", "<Key>foo+bar+2</Key>"}},
+	}
 
-	getContent, err := ioutil.ReadAll(response.Body)
-	c.Assert(err, nil)
-	c.Assert(strings.Contains(string(getContent), "<Key>bar</Key>"), true)
+	for _, testCase := range testCases {
+		// create listObjectsV1 request with valid parameters
+		request, err = newTestSignedRequest("GET", testCase.getURL, 0, nil, s.accessKey, s.secretKey, s.signer)
+		c.Assert(err, nil)
+		client = http.Client{Transport: s.transport}
+		// execute the HTTP request.
+		response, err = client.Do(request)
+		c.Assert(err, nil)
+		c.Assert(response.StatusCode, http.StatusOK)
 
-	// create listObjectsV2 request with valid parameters
-	request, err = newTestSignedRequest("GET", getListObjectsV2URL(s.endPoint, bucketName, "1000", ""),
-		0, nil, s.accessKey, s.secretKey, s.signer)
-	c.Assert(err, nil)
-	client = http.Client{Transport: s.transport}
-	// execute the HTTP request.
-	response, err = client.Do(request)
-	c.Assert(err, nil)
-	c.Assert(response.StatusCode, http.StatusOK)
+		getContent, err := ioutil.ReadAll(response.Body)
+		c.Assert(err, nil)
 
-	getContent, err = ioutil.ReadAll(response.Body)
-	c.Assert(err, nil)
-	c.Assert(strings.Contains(string(getContent), "<Key>bar</Key>"), true)
-	c.Assert(strings.Contains(string(getContent), "<Owner><ID></ID><DisplayName></DisplayName></Owner>"), true)
-
-	// create listObjectsV2 request with valid parameters and fetch-owner activated
-	request, err = newTestSignedRequest("GET", getListObjectsV2URL(s.endPoint, bucketName, "1000", "true"),
-		0, nil, s.accessKey, s.secretKey, s.signer)
-	c.Assert(err, nil)
-	client = http.Client{Transport: s.transport}
-	// execute the HTTP request.
-	response, err = client.Do(request)
-	c.Assert(err, nil)
-	c.Assert(response.StatusCode, http.StatusOK)
-
-	getContent, err = ioutil.ReadAll(response.Body)
-	c.Assert(err, nil)
-
-	c.Assert(strings.Contains(string(getContent), "<Key>bar</Key>"), true)
-	c.Assert(strings.Contains(string(getContent), fmt.Sprintf("<Owner><ID>%s</ID><DisplayName></DisplayName></Owner>",
-		globalMinioDefaultOwnerID)), true)
-
+		for _, expectedStr := range testCase.expectedStrings {
+			c.Assert(strings.Contains(string(getContent), expectedStr), true)
+		}
+	}
 }
 
 // TestListObjectsHandlerErrors - Setting invalid parameters to List Objects
@@ -1732,7 +1728,7 @@ func (s *TestSuiteCommon) TestListObjectsHandlerErrors(c *check) {
 	c.Assert(response.StatusCode, http.StatusOK)
 
 	// create listObjectsV1 request with invalid value of max-keys parameter. max-keys is set to -2.
-	request, err = newTestSignedRequest("GET", getListObjectsV1URL(s.endPoint, bucketName, "-2"),
+	request, err = newTestSignedRequest("GET", getListObjectsV1URL(s.endPoint, bucketName, "", "-2", ""),
 		0, nil, s.accessKey, s.secretKey, s.signer)
 	c.Assert(err, nil)
 	client = http.Client{Transport: s.transport}
@@ -1743,7 +1739,7 @@ func (s *TestSuiteCommon) TestListObjectsHandlerErrors(c *check) {
 	verifyError(c, response, "InvalidArgument", "Argument maxKeys must be an integer between 0 and 2147483647", http.StatusBadRequest)
 
 	// create listObjectsV2 request with invalid value of max-keys parameter. max-keys is set to -2.
-	request, err = newTestSignedRequest("GET", getListObjectsV2URL(s.endPoint, bucketName, "-2", ""),
+	request, err = newTestSignedRequest("GET", getListObjectsV2URL(s.endPoint, bucketName, "", "-2", "", ""),
 		0, nil, s.accessKey, s.secretKey, s.signer)
 	c.Assert(err, nil)
 	client = http.Client{Transport: s.transport}
@@ -1793,7 +1789,7 @@ func (s *TestSuiteCommon) TestPutBucketErrors(c *check) {
 		http.StatusConflict)
 
 	// request for ACL.
-	// Since Minio server doesn't support ACL's the request is expected to fail with  "NotImplemented" error message.
+	// Since MinIO server doesn't support ACL's the request is expected to fail with  "NotImplemented" error message.
 	request, err = newTestSignedRequest("PUT", s.endPoint+"/"+bucketName+"?acl",
 		0, nil, s.accessKey, s.secretKey, s.signer)
 	c.Assert(err, nil)
@@ -2728,12 +2724,9 @@ func (s *TestSuiteCommon) TestObjectMultipart(c *check) {
 	c.Assert(response.StatusCode, http.StatusOK)
 	var parts []CompletePart
 	for _, part := range completeUploads.Parts {
-		// For compressed objects, we dont treat E-Tag as checksum.
-		part.ETag = strings.Replace(part.ETag, "-1", "", -1)
 		part.ETag = canonicalizeETag(part.ETag)
 		parts = append(parts, part)
 	}
-	etag, err := getCompleteMultipartMD5(context.Background(), parts)
-	c.Assert(err, nil)
+	etag := getCompleteMultipartMD5(parts)
 	c.Assert(canonicalizeETag(response.Header.Get("Etag")), etag)
 }

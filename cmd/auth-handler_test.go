@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -377,11 +378,13 @@ func TestIsReqAuthenticated(t *testing.T) {
 		{mustNewSignedRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrNone},
 	}
 
+	ctx := context.Background()
 	// Validates all testcases.
 	for i, testCase := range testCases {
-		if s3Error := isReqAuthenticated(testCase.req, globalServerConfig.GetRegion()); s3Error != testCase.s3Error {
-			if _, err := ioutil.ReadAll(testCase.req.Body); toAPIErrorCode(err) != testCase.s3Error {
-				t.Fatalf("Test %d: Unexpected S3 error: want %d - got %d (got after reading request %d)", i, testCase.s3Error, s3Error, toAPIErrorCode(err))
+		s3Error := isReqAuthenticated(ctx, testCase.req, globalServerConfig.GetRegion(), serviceS3)
+		if s3Error != testCase.s3Error {
+			if _, err := ioutil.ReadAll(testCase.req.Body); toAPIErrorCode(ctx, err) != testCase.s3Error {
+				t.Fatalf("Test %d: Unexpected S3 error: want %d - got %d (got after reading request %s)", i, testCase.s3Error, s3Error, toAPIError(ctx, err).Code)
 			}
 		}
 	}
@@ -413,8 +416,9 @@ func TestCheckAdminRequestAuthType(t *testing.T) {
 		{Request: mustNewPresignedV2Request("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
 		{Request: mustNewPresignedRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: ErrAccessDenied},
 	}
+	ctx := context.Background()
 	for i, testCase := range testCases {
-		if s3Error := checkAdminRequestAuthType(testCase.Request, globalServerConfig.GetRegion()); s3Error != testCase.ErrCode {
+		if s3Error := checkAdminRequestAuthType(ctx, testCase.Request, globalServerConfig.GetRegion()); s3Error != testCase.ErrCode {
 			t.Errorf("Test %d: Unexpected s3error returned wanted %d, got %d", i, testCase.ErrCode, s3Error)
 		}
 	}

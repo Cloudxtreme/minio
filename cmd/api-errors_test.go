@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -24,7 +25,7 @@ import (
 	"github.com/minio/minio/pkg/hash"
 )
 
-var toAPIErrorCodeTests = []struct {
+var toAPIErrorTests = []struct {
 	err     error
 	errCode APIErrorCode
 }{
@@ -52,10 +53,9 @@ var toAPIErrorCodeTests = []struct {
 	{err: errSignatureMismatch, errCode: ErrSignatureDoesNotMatch},
 
 	// SSE-C errors
-	{err: errInsecureSSERequest, errCode: ErrInsecureSSECustomerRequest},
 	{err: crypto.ErrInvalidCustomerAlgorithm, errCode: ErrInvalidSSECustomerAlgorithm},
 	{err: crypto.ErrMissingCustomerKey, errCode: ErrMissingSSECustomerKey},
-	{err: crypto.ErrInvalidCustomerKey, errCode: ErrInvalidSSECustomerKey},
+	{err: crypto.ErrInvalidCustomerKey, errCode: ErrAccessDenied},
 	{err: crypto.ErrMissingCustomerKeyMD5, errCode: ErrMissingSSECustomerKeyMD5},
 	{err: crypto.ErrCustomerKeyMD5Mismatch, errCode: ErrSSECustomerKeyMD5Mismatch},
 	{err: errObjectTampered, errCode: ErrObjectTampered},
@@ -65,8 +65,9 @@ var toAPIErrorCodeTests = []struct {
 }
 
 func TestAPIErrCode(t *testing.T) {
-	for i, testCase := range toAPIErrorCodeTests {
-		errCode := toAPIErrorCode(testCase.err)
+	ctx := context.Background()
+	for i, testCase := range toAPIErrorTests {
+		errCode := toAPIErrorCode(ctx, testCase.err)
 		if errCode != testCase.errCode {
 			t.Errorf("Test %d: Expected error code %d, got %d", i+1, testCase.errCode, errCode)
 		}

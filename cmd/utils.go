@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/minio/minio/cmd/logger"
@@ -105,6 +104,12 @@ const (
 	httpsScheme = "https"
 )
 
+// nopCharsetConverter is a dummy charset convert which just copies input to output,
+// it is used to ignore custom encoding charset in S3 XML body.
+func nopCharsetConverter(label string, input io.Reader) (io.Reader, error) {
+	return input, nil
+}
+
 // xmlDecoder provide decoded value in xml.
 func xmlDecoder(body io.Reader, v interface{}, size int64) error {
 	var lbody io.Reader
@@ -114,6 +119,8 @@ func xmlDecoder(body io.Reader, v interface{}, size int64) error {
 		lbody = body
 	}
 	d := xml.NewDecoder(lbody)
+	// Ignore any encoding set in the XML body
+	d.CharsetReader = nopCharsetConverter
 	return d.Decode(v)
 }
 
@@ -200,12 +207,28 @@ func (p profilerWrapper) Path() string {
 	return p.pathFn()
 }
 
-// Starts a profiler returns nil if profiler is not enabled, caller needs to handle this.
-func startProfiler(profilerType, dirPath string) (interface {
-	Stop()
-	Path() string
-}, error) {
+// Returns current profile data, returns error if there is no active
+// profiling in progress. Stops an active profile.
+func getProfileData() ([]byte, error) {
+	if globalProfiler == nil {
+		return nil, errors.New("profiler not enabled")
+	}
 
+	profilerPath := globalProfiler.Path()
+
+	// Stop the profiler
+	globalProfiler.Stop()
+
+	profilerFile, err := os.Open(profilerPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return ioutil.ReadAll(profilerFile)
+}
+
+// Starts a profiler returns nil if profiler is not enabled, caller needs to handle this.
+func startProfiler(profilerType, dirPath string) (minioProfiler, error) {
 	var err error
 	if dirPath == "" {
 		dirPath, err = ioutil.TempDir("", "profile")
@@ -218,18 +241,26 @@ func startProfiler(profilerType, dirPath string) (interface {
 		Stop()
 	}
 
-	// Enable profiler, supported types are [cpu, mem, block].
+	var profilerFileName string
+
+	// Enable profiler and set the name of the file that pkg/pprof
+	// library creates to store profiling data.
 	switch profilerType {
 	case "cpu":
 		profiler = profile.Start(profile.CPUProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "cpu.pprof"
 	case "mem":
 		profiler = profile.Start(profile.MemProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "mem.pprof"
 	case "block":
 		profiler = profile.Start(profile.BlockProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "block.pprof"
 	case "mutex":
 		profiler = profile.Start(profile.MutexProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "mutex.pprof"
 	case "trace":
 		profiler = profile.Start(profile.TraceProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
+		profilerFileName = "trace.out"
 	default:
 		return nil, errors.New("profiler type unknown")
 	}
@@ -237,18 +268,21 @@ func startProfiler(profilerType, dirPath string) (interface {
 	return &profilerWrapper{
 		stopFn: profiler.Stop,
 		pathFn: func() string {
-			return filepath.Join(dirPath, profilerType+".pprof")
+			return filepath.Join(dirPath, profilerFileName)
 		},
 	}, nil
 }
 
-// Global profiler to be used by service go-routine.
-var globalProfiler interface {
+// minioProfiler - minio profiler interface.
+type minioProfiler interface {
 	// Stop the profiler
 	Stop()
 	// Return the path of the profiling file
 	Path() string
 }
+
+// Global profiler to be used by service go-routine.
+var globalProfiler minioProfiler
 
 // dump the request into a string in JSON format.
 func dumpRequest(r *http.Request) string {
@@ -272,7 +306,7 @@ func dumpRequest(r *http.Request) string {
 	}
 
 	// Formatted string.
-	return strings.TrimSpace(string(buffer.Bytes()))
+	return strings.TrimSpace(buffer.String())
 }
 
 // isFile - returns whether given path is a file or not.
@@ -389,12 +423,13 @@ func newContext(r *http.Request, w http.ResponseWriter, api string) context.Cont
 		object = prefix
 	}
 	reqInfo := &logger.ReqInfo{
-		RequestID:  w.Header().Get(responseRequestIDKey),
-		RemoteHost: handlers.GetSourceIP(r),
-		UserAgent:  r.UserAgent(),
-		API:        api,
-		BucketName: bucket,
-		ObjectName: object,
+		DeploymentID: w.Header().Get(responseDeploymentIDKey),
+		RequestID:    w.Header().Get(responseRequestIDKey),
+		RemoteHost:   handlers.GetSourceIP(r),
+		UserAgent:    r.UserAgent(),
+		API:          api,
+		BucketName:   bucket,
+		ObjectName:   object,
 	}
 	return logger.SetReqInfo(context.Background(), reqInfo)
 }
@@ -428,35 +463,6 @@ func isNetworkOrHostDown(err error) bool {
 		}
 	}
 	return false
-}
-
-var b512pool = sync.Pool{
-	New: func() interface{} {
-		buf := make([]byte, 512)
-		return &buf
-	},
-}
-
-// CloseResponse close non nil response with any response Body.
-// convenient wrapper to drain any remaining data on response body.
-//
-// Subsequently this allows golang http RoundTripper
-// to re-use the same connection for future requests.
-func CloseResponse(respBody io.ReadCloser) {
-	// Callers should close resp.Body when done reading from it.
-	// If resp.Body is not closed, the Client's underlying RoundTripper
-	// (typically Transport) may not be able to re-use a persistent TCP
-	// connection to the server for a subsequent "keep-alive" request.
-	if respBody != nil {
-		// Drain any remaining Body and then close the connection.
-		// Without this closing connection would disallow re-using
-		// the same connection for future uses.
-		//  - http://stackoverflow.com/a/17961593/4465767
-		bufp := b512pool.Get().(*[]byte)
-		defer b512pool.Put(bufp)
-		io.CopyBuffer(ioutil.Discard, respBody, *bufp)
-		respBody.Close()
-	}
 }
 
 // Used for registering with rest handlers (have a look at registerStorageRESTHandlers for usage example)

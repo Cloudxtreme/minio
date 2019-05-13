@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,20 +24,40 @@ import (
 type name string
 
 const (
-	stringEquals    name = "StringEquals"
-	stringNotEquals      = "StringNotEquals"
-	stringLike           = "StringLike"
-	stringNotLike        = "StringNotLike"
-	ipAddress            = "IpAddress"
-	notIPAddress         = "NotIpAddress"
-	null                 = "Null"
+	stringEquals              name = "StringEquals"
+	stringNotEquals                = "StringNotEquals"
+	stringEqualsIgnoreCase         = "StringEqualsIgnoreCase"
+	stringNotEqualsIgnoreCase      = "StringNotEqualsIgnoreCase"
+	stringLike                     = "StringLike"
+	stringNotLike                  = "StringNotLike"
+	binaryEquals                   = "BinaryEquals"
+	ipAddress                      = "IpAddress"
+	notIPAddress                   = "NotIpAddress"
+	null                           = "Null"
+	boolean                        = "Bool"
 )
+
+var supportedConditions = []name{
+	stringEquals,
+	stringNotEquals,
+	stringEqualsIgnoreCase,
+	stringNotEqualsIgnoreCase,
+	binaryEquals,
+	stringLike,
+	stringNotLike,
+	ipAddress,
+	notIPAddress,
+	null,
+	boolean,
+	// Add new conditions here.
+}
 
 // IsValid - checks if name is valid or not.
 func (n name) IsValid() bool {
-	switch n {
-	case stringEquals, stringNotEquals, stringLike, stringNotLike, ipAddress, notIPAddress, null:
-		return true
+	for _, supn := range supportedConditions {
+		if n == supn {
+			return true
+		}
 	}
 
 	return false

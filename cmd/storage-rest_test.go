@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -260,7 +260,7 @@ func testStorageAPIListDir(t *testing.T, storage StorageAPI) {
 	}
 
 	for i, testCase := range testCases {
-		result, err := storage.ListDir(testCase.volumeName, testCase.prefix, -1)
+		result, err := storage.ListDir(testCase.volumeName, testCase.prefix, -1, "")
 		expectErr := (err != nil)
 
 		if expectErr != testCase.expectErr {
@@ -361,38 +361,6 @@ func testStorageAPIReadFile(t *testing.T, storage StorageAPI) {
 			if !reflect.DeepEqual(result, testCase.expectedResult) {
 				t.Fatalf("case %v: result: expected: %v, got: %v", i+1, string(testCase.expectedResult), string(result))
 			}
-		}
-	}
-}
-
-func testStorageAPIPrepareFile(t *testing.T, storage StorageAPI) {
-	tmpGlobalServerConfig := globalServerConfig
-	defer func() {
-		globalServerConfig = tmpGlobalServerConfig
-	}()
-	globalServerConfig = newServerConfig()
-
-	err := storage.MakeVol("foo")
-	if err != nil {
-		t.Fatalf("unexpected error %v", err)
-	}
-
-	testCases := []struct {
-		volumeName string
-		objectName string
-		expectErr  bool
-	}{
-		{"foo", "myobject", false},
-		// volume not found error.
-		{"bar", "myobject", true},
-	}
-
-	for i, testCase := range testCases {
-		err := storage.PrepareFile(testCase.volumeName, testCase.objectName, 1)
-		expectErr := (err != nil)
-
-		if expectErr != testCase.expectErr {
-			t.Fatalf("case %v: error: expected: %v, got: %v", i+1, testCase.expectErr, expectErr)
 		}
 	}
 }
@@ -540,8 +508,15 @@ func newStorageRESTHTTPServerClient(t *testing.T) (*httptest.Server, *storageRES
 		t.Fatalf("NewEndpoint failed %v", endpoint)
 	}
 
+	if err := endpoint.UpdateIsLocal(); err != nil {
+		t.Fatalf("UpdateIsLocal failed %v", err)
+	}
+
 	registerStorageRESTHandlers(router, EndpointList{endpoint})
-	restClient := newStorageRESTClient(endpoint)
+	restClient, err := newStorageRESTClient(endpoint)
+	if err != nil {
+		t.Fatalf("newStorageRESTClient failed for %v, with error %s", endpoint, err)
+	}
 
 	prevGlobalServerConfig := globalServerConfig
 	globalServerConfig = newServerConfig()
@@ -646,17 +621,6 @@ func TestStorageRESTClientReadFile(t *testing.T) {
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIReadFile(t, restClient)
-}
-
-func TestStorageRESTClientPrepareFile(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
-	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
-	defer os.RemoveAll(endpointPath)
-
-	testStorageAPIPrepareFile(t, restClient)
 }
 
 func TestStorageRESTClientAppendFile(t *testing.T) {

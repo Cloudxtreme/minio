@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,22 +19,15 @@ package policy
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
+	"unicode/utf8"
 )
-
-var idRegexp = regexp.MustCompile("^[[:alnum:]]+$")
 
 // ID - policy ID.
 type ID string
 
 // IsValid - checks if ID is valid or not.
 func (id ID) IsValid() bool {
-	// Allow empty string as ID.
-	if string(id) == "" {
-		return true
-	}
-
-	return idRegexp.MatchString(string(id))
+	return utf8.ValidString(string(id))
 }
 
 // MarshalJSON - encodes ID to JSON data.

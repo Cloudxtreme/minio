@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -26,9 +27,15 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
+	humanize "github.com/dustin/go-humanize"
+	"github.com/minio/cli"
 	"github.com/minio/minio-go/pkg/set"
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/cpu"
+	"github.com/minio/minio/pkg/disk"
+	"github.com/minio/minio/pkg/mem"
 	"github.com/minio/minio/pkg/mountinfo"
 )
 
@@ -41,6 +48,8 @@ const (
 
 	// URLEndpointType - URL style endpoint type enum.
 	URLEndpointType
+
+	retryInterval = 5 // In Seconds.
 )
 
 // Endpoint - any type of endpoint.
@@ -48,6 +57,7 @@ type Endpoint struct {
 	*url.URL
 	IsLocal  bool
 	SetIndex int
+	HostName string
 }
 
 func (endpoint Endpoint) String() string {
@@ -72,6 +82,19 @@ func (endpoint Endpoint) IsHTTPS() bool {
 	return endpoint.Scheme == "https"
 }
 
+// UpdateIsLocal - resolves the host and updates if it is local or not.
+func (endpoint *Endpoint) UpdateIsLocal() error {
+	if !endpoint.IsLocal {
+		isLocal, err := isLocalHost(endpoint.HostName)
+		if err != nil {
+			return err
+		}
+		endpoint.IsLocal = isLocal
+
+	}
+	return nil
+}
+
 // NewEndpoint - returns new endpoint based on given arguments.
 func NewEndpoint(arg string) (ep Endpoint, e error) {
 	// isEmptyPath - check whether given path is not empty.
@@ -84,6 +107,7 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 	}
 
 	var isLocal bool
+	var host string
 	u, err := url.Parse(arg)
 	if err == nil && u.Host != "" {
 		// URL style of endpoint.
@@ -91,11 +115,11 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 		// - Scheme field must contain "http" or "https"
 		// - All field should be empty except Host and Path.
 		if !((u.Scheme == "http" || u.Scheme == "https") &&
-			u.User == nil && u.Opaque == "" && u.ForceQuery == false && u.RawQuery == "" && u.Fragment == "") {
+			u.User == nil && u.Opaque == "" && !u.ForceQuery && u.RawQuery == "" && u.Fragment == "") {
 			return ep, fmt.Errorf("invalid URL endpoint format")
 		}
 
-		var host, port string
+		var port string
 		host, port, err = net.SplitHostPort(u.Host)
 		if err != nil {
 			if !strings.Contains(err.Error(), "missing port in address") {
@@ -111,6 +135,9 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 			} else if p < 1 || p > 65535 {
 				return ep, fmt.Errorf("invalid URL endpoint format: port number must be between 1 to 65535")
 			}
+		}
+		if i := strings.Index(host, "%"); i > -1 {
+			host = host[:i]
 		}
 
 		if host == "" {
@@ -144,15 +171,11 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 			}
 		}
 
-		isLocal, err = isLocalHost(host)
-		if err != nil {
-			return ep, err
-		}
 	} else {
 		// Only check if the arg is an ip address and ask for scheme since its absent.
 		// localhost, example.com, any FQDN cannot be disambiguated from a regular file path such as
 		// /mnt/export1. So we go ahead and start the minio server in FS modes in these cases.
-		if isHostIPv4(arg) {
+		if isHostIP(arg) {
 			return ep, fmt.Errorf("invalid URL endpoint format: missing scheme http or https")
 		}
 		u = &url.URL{Path: path.Clean(arg)}
@@ -160,8 +183,9 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 	}
 
 	return Endpoint{
-		URL:     u,
-		IsLocal: isLocal,
+		URL:      u,
+		IsLocal:  isLocal,
+		HostName: host,
 	}, nil
 }
 
@@ -192,6 +216,146 @@ func (endpoints EndpointList) GetString(i int) string {
 		return ""
 	}
 	return endpoints[i].String()
+}
+
+// UpdateIsLocal - resolves the host and discovers the local host.
+func (endpoints EndpointList) UpdateIsLocal() error {
+	var epsResolved int
+	var foundLocal bool
+	resolvedList := make([]bool, len(endpoints))
+	// Mark the starting time
+	startTime := time.Now()
+	keepAliveTicker := time.NewTicker(retryInterval * time.Second)
+	defer keepAliveTicker.Stop()
+	for {
+		// Break if the local endpoint is found already. Or all the endpoints are resolved.
+		if foundLocal || (epsResolved == len(endpoints)) {
+			break
+		}
+		// Retry infinitely on Kubernetes and Docker swarm.
+		// This is needed as the remote hosts are sometime
+		// not available immediately.
+		select {
+		case <-globalOSSignalCh:
+			return fmt.Errorf("The endpoint resolution got interrupted")
+		default:
+			for i, resolved := range resolvedList {
+				if resolved {
+					continue
+				}
+
+				// return err if not Docker or Kubernetes
+				// We use IsDocker() method to check for Docker Swarm environment
+				// as there is no reliable way to clearly identify Swarm from
+				// Docker environment.
+				isLocal, err := isLocalHost(endpoints[i].HostName)
+				if err != nil {
+					if !IsDocker() && !IsKubernetes() {
+						return err
+					}
+					// time elapsed
+					timeElapsed := time.Since(startTime)
+					// log error only if more than 1s elapsed
+					if timeElapsed > time.Second {
+						// log the message to console about the host not being
+						// resolveable.
+						reqInfo := (&logger.ReqInfo{}).AppendTags("host", endpoints[i].HostName)
+						reqInfo.AppendTags("elapsedTime", humanize.RelTime(startTime, startTime.Add(timeElapsed), "elapsed", ""))
+						ctx := logger.SetReqInfo(context.Background(), reqInfo)
+						logger.LogIf(ctx, err)
+					}
+				} else {
+					resolvedList[i] = true
+					endpoints[i].IsLocal = isLocal
+					epsResolved++
+					if !foundLocal {
+						foundLocal = isLocal
+					}
+				}
+			}
+
+			// Wait for the tick, if the there exist a local endpoint in discovery.
+			// Non docker/kubernetes environment does not need to wait.
+			if !foundLocal && (IsDocker() && IsKubernetes()) {
+				<-keepAliveTicker.C
+			}
+		}
+	}
+
+	return nil
+
+}
+
+// localEndpointsMemUsage - returns ServerMemUsageInfo for only the
+// local endpoints from given list of endpoints
+func localEndpointsMemUsage(endpoints EndpointList) ServerMemUsageInfo {
+	var memUsages []mem.Usage
+	var historicUsages []mem.Usage
+	scratchSpace := map[string]bool{}
+	for _, endpoint := range endpoints {
+		// Only proceed for local endpoints
+		if endpoint.IsLocal {
+			if _, ok := scratchSpace[endpoint.Host]; ok {
+				continue
+			}
+			memUsages = append(memUsages, mem.GetUsage())
+			historicUsages = append(historicUsages, mem.GetHistoricUsage())
+			scratchSpace[endpoint.Host] = true
+		}
+	}
+	return ServerMemUsageInfo{
+		Addr:          GetLocalPeer(endpoints),
+		Usage:         memUsages,
+		HistoricUsage: historicUsages,
+	}
+}
+
+// localEndpointsCPULoad - returns ServerCPULoadInfo for only the
+// local endpoints from given list of endpoints
+func localEndpointsCPULoad(endpoints EndpointList) ServerCPULoadInfo {
+	var cpuLoads []cpu.Load
+	var historicLoads []cpu.Load
+	scratchSpace := map[string]bool{}
+	for _, endpoint := range endpoints {
+		// Only proceed for local endpoints
+		if endpoint.IsLocal {
+			if _, ok := scratchSpace[endpoint.Host]; ok {
+				continue
+			}
+			cpuLoads = append(cpuLoads, cpu.GetLoad())
+			historicLoads = append(historicLoads, cpu.GetHistoricLoad())
+			scratchSpace[endpoint.Host] = true
+		}
+	}
+	return ServerCPULoadInfo{
+		Addr:         GetLocalPeer(endpoints),
+		Load:         cpuLoads,
+		HistoricLoad: historicLoads,
+	}
+}
+
+// localEndpointsDrivePerf - returns ServerDrivesPerfInfo for only the
+// local endpoints from given list of endpoints
+func localEndpointsDrivePerf(endpoints EndpointList) ServerDrivesPerfInfo {
+	var dps []disk.Performance
+	for _, endpoint := range endpoints {
+		// Only proceed for local endpoints
+		if endpoint.IsLocal {
+			if _, err := os.Stat(endpoint.Path); err != nil {
+				// Since this drive is not available, add relevant details and proceed
+				dps = append(dps, disk.Performance{Path: endpoint.Path, Error: err.Error()})
+				continue
+			}
+			dp := disk.GetPerformance(pathJoin(endpoint.Path, minioMetaTmpBucket, mustGetUUID()))
+			dp.Path = endpoint.Path
+			dps = append(dps, dp)
+		}
+	}
+
+	return ServerDrivesPerfInfo{
+		Addr: GetLocalPeer(endpoints),
+		Perf: dps,
+	}
 }
 
 // NewEndpointList - returns new endpoint list based on input args.
@@ -228,6 +392,26 @@ func NewEndpointList(args ...string) (endpoints EndpointList, err error) {
 	return endpoints, nil
 }
 
+func checkEndpointsSubOptimal(ctx *cli.Context, setupType SetupType, endpoints EndpointList) (err error) {
+	// Validate sub optimal ordering only for distributed setup.
+	if setupType != DistXLSetupType {
+		return nil
+	}
+	var endpointOrder int
+	err = fmt.Errorf("Too many disk args are local, input is in sub-optimal order. Please review input args: %s", ctx.Args())
+	for _, endpoint := range endpoints {
+		if endpoint.IsLocal {
+			endpointOrder++
+		} else {
+			endpointOrder--
+		}
+		if endpointOrder >= 2 {
+			return err
+		}
+	}
+	return nil
+}
+
 // Checks if there are any cross device mounts.
 func checkCrossDeviceMounts(endpoints EndpointList) (err error) {
 	var absPaths []string
@@ -262,6 +446,9 @@ func CreateEndpoints(serverAddr string, args ...[]string) (string, EndpointList,
 		var endpoint Endpoint
 		endpoint, err = NewEndpoint(args[0][0])
 		if err != nil {
+			return serverAddr, endpoints, setupType, err
+		}
+		if err := endpoint.UpdateIsLocal(); err != nil {
 			return serverAddr, endpoints, setupType, err
 		}
 		if endpoint.Type() != PathEndpointType {
@@ -304,6 +491,10 @@ func CreateEndpoints(serverAddr string, args ...[]string) (string, EndpointList,
 		return serverAddr, endpoints, setupType, nil
 	}
 
+	if err := endpoints.UpdateIsLocal(); err != nil {
+		return serverAddr, endpoints, setupType, uiErrInvalidErasureEndpoints(nil).Msg(err.Error())
+	}
+
 	// Here all endpoints are URL style.
 	endpointPathSet := set.NewStringSet()
 	localEndpointCount := 0
@@ -341,7 +532,7 @@ func CreateEndpoints(serverAddr string, args ...[]string) (string, EndpointList,
 			if err != nil {
 				host = endpoint.Host
 			}
-			hostIPSet, _ := getHostIP4(host)
+			hostIPSet, _ := getHostIP(host)
 			if IPSet, ok := pathIPMap[endpoint.Path]; ok {
 				if !IPSet.Intersection(hostIPSet).IsEmpty() {
 					return serverAddr, endpoints, setupType,
@@ -411,12 +602,12 @@ func CreateEndpoints(serverAddr string, args ...[]string) (string, EndpointList,
 				host = localServerAddr
 			}
 
-			ipList, err := getHostIP4(host)
+			ipList, err := getHostIP(host)
 			logger.FatalIf(err, "unexpected error when resolving host '%s'", host)
 
-			// Filter ipList by IPs those start with '127.'.
+			// Filter ipList by IPs those start with '127.' or '::1'
 			loopBackIPs := ipList.FuncMatch(func(ip string, matchString string) bool {
-				return strings.HasPrefix(ip, "127.")
+				return strings.HasPrefix(ip, "127.") || strings.HasPrefix(ip, "::1")
 			}, "")
 
 			// If loop back IP is found and ipList contains only loop back IPs, then error out.
@@ -455,7 +646,12 @@ func CreateEndpoints(serverAddr string, args ...[]string) (string, EndpointList,
 		return serverAddr, endpoints, setupType, err
 	}
 
-	updateDomainIPs(uniqueArgs)
+	_, dok := os.LookupEnv("MINIO_DOMAIN")
+	_, eok := os.LookupEnv("MINIO_ETCD_ENDPOINTS")
+	_, iok := os.LookupEnv("MINIO_PUBLIC_IPS")
+	if dok && eok && !iok {
+		updateDomainIPs(uniqueArgs)
+	}
 
 	setupType = DistXLSetupType
 	return serverAddr, endpoints, setupType, nil
@@ -480,10 +676,10 @@ func GetLocalPeer(endpoints EndpointList) (localPeer string) {
 		// Local peer can be empty in FS or Erasure coded mode.
 		// If so, return globalMinioHost + globalMinioPort value.
 		if globalMinioHost != "" {
-			return globalMinioHost + ":" + globalMinioPort
+			return net.JoinHostPort(globalMinioHost, globalMinioPort)
 		}
 
-		return "127.0.0.1:" + globalMinioPort
+		return net.JoinHostPort("127.0.0.1", globalMinioPort)
 	}
 	return peerSet.ToSlice()[0]
 }
@@ -509,21 +705,21 @@ func GetRemotePeers(endpoints EndpointList) []string {
 	return peerSet.ToSlice()
 }
 
-// In federated and distributed setup, update IP addresses of the hosts passed in command line
-// if MINIO_PUBLIC_IPS are not set manually
 func updateDomainIPs(endPoints set.StringSet) {
-	_, dok := os.LookupEnv("MINIO_DOMAIN")
-	_, eok := os.LookupEnv("MINIO_ETCD_ENDPOINTS")
-	_, iok := os.LookupEnv("MINIO_PUBLIC_IPS")
-	if dok && eok && !iok {
-		globalDomainIPs = set.NewStringSet()
-		for e := range endPoints {
-			host, _, _ := net.SplitHostPort(e)
-			ipList, _ := getHostIP4(host)
-			remoteIPList := ipList.FuncMatch(func(ip string, matchString string) bool {
-				return !strings.HasPrefix(ip, "127.")
-			}, "")
-			globalDomainIPs.Add(remoteIPList.ToSlice()[0])
+	ipList := set.NewStringSet()
+	for e := range endPoints {
+		host, _, err := net.SplitHostPort(e)
+		if err != nil {
+			if strings.Contains(err.Error(), "missing port in address") {
+				host = e
+			} else {
+				continue
+			}
 		}
+		IPs, _ := getHostIP(host)
+		ipList = ipList.Union(IPs)
 	}
+	globalDomainIPs = ipList.FuncMatch(func(ip string, matchString string) bool {
+		return !strings.HasPrefix(ip, "127.") || strings.HasPrefix(ip, "::1")
+	}, "")
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,10 @@ package cmd
 
 import (
 	"net/http"
+	"os"
+	"strings"
 
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/hash"
 
 	minio "github.com/minio/minio-go"
@@ -30,7 +33,27 @@ var (
 
 	// MustGetUUID function alias.
 	MustGetUUID = mustGetUUID
+
+	// CleanMetadataKeys provides cleanMetadataKeys function alias.
+	CleanMetadataKeys = cleanMetadataKeys
+
+	// PathJoin function alias.
+	PathJoin = pathJoin
+
+	// ListObjects function alias.
+	ListObjects = listObjects
+
+	// FilterMatchingPrefix function alias.
+	FilterMatchingPrefix = filterMatchingPrefix
+
+	// IsStringEqual is string equal.
+	IsStringEqual = isStringEqual
 )
+
+// StatInfo -  alias for statInfo
+type StatInfo struct {
+	statInfo
+}
 
 // AnonErrToObjectErr - converts standard http codes into meaningful object layer errors.
 func AnonErrToObjectErr(statusCode int, params ...string) error {
@@ -155,6 +178,7 @@ func FromMinioClientObjectInfo(bucket string, oi minio.ObjectInfo) ObjectInfo {
 		ContentType:     oi.ContentType,
 		ContentEncoding: oi.Metadata.Get("Content-Encoding"),
 		StorageClass:    oi.StorageClass,
+		Expires:         oi.Expires,
 	}
 }
 
@@ -259,7 +283,7 @@ func ToMinioClientCompleteParts(parts []CompletePart) []minio.CompletePart {
 	return mparts
 }
 
-// ErrorRespToObjectError converts Minio errors to minio object layer errors.
+// ErrorRespToObjectError converts MinIO errors to minio object layer errors.
 func ErrorRespToObjectError(err error, params ...string) error {
 	if err == nil {
 		return nil
@@ -280,7 +304,7 @@ func ErrorRespToObjectError(err error, params ...string) error {
 
 	minioErr, ok := err.(minio.ErrorResponse)
 	if !ok {
-		// We don't interpret non Minio errors. As minio errors will
+		// We don't interpret non MinIO errors. As minio errors will
 		// have StatusCode to help to convert to object errors.
 		return err
 	}
@@ -294,6 +318,8 @@ func ErrorRespToObjectError(err error, params ...string) error {
 		err = BucketPolicyNotFound{}
 	case "InvalidBucketName":
 		err = BucketNameInvalid{Bucket: bucket}
+	case "InvalidPart":
+		err = InvalidPart{}
 	case "NoSuchBucket":
 		err = BucketNotFound{Bucket: bucket}
 	case "NoSuchKey":
@@ -318,4 +344,36 @@ func ErrorRespToObjectError(err error, params ...string) error {
 	}
 
 	return err
+}
+
+// ComputeCompleteMultipartMD5 calculates MD5 ETag for complete multipart responses
+func ComputeCompleteMultipartMD5(parts []CompletePart) string {
+	return getCompleteMultipartMD5(parts)
+}
+
+// parse gateway sse env variable
+func parseGatewaySSE(s string) (gatewaySSE, error) {
+	l := strings.Split(s, ";")
+	var gwSlice = make([]string, 0)
+	for _, val := range l {
+		v := strings.ToUpper(val)
+		if v == gatewaySSES3 || v == gatewaySSEC {
+			gwSlice = append(gwSlice, v)
+			continue
+		}
+		return nil, uiErrInvalidGWSSEValue(nil).Msg("gateway SSE cannot be (%s) ", v)
+	}
+	return gatewaySSE(gwSlice), nil
+}
+
+// handle gateway env vars
+func handleGatewayEnvVars() {
+	gwsseVal, ok := os.LookupEnv("MINIO_GATEWAY_SSE")
+	if ok {
+		var err error
+		GlobalGatewaySSE, err = parseGatewaySSE(gwsseVal)
+		if err != nil {
+			logger.Fatal(err, "Unable to parse MINIO_GATEWAY_SSE value (`%s`)", gwsseVal)
+		}
+	}
 }

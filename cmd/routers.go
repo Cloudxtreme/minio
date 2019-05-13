@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,25 +38,24 @@ func registerDistXLRouters(router *mux.Router, endpoints EndpointList) {
 	// Register storage rpc router only if its a distributed setup.
 	registerStorageRESTHandlers(router, endpoints)
 
-	// Register distributed namespace lock.
-	registerDistNSLockRouter(router)
+	// Register peer REST router only if its a distributed setup.
+	registerPeerRESTHandlers(router)
 
-	// Register S3 peer communication router.
-	registerPeerRPCRouter(router)
+	// Register distributed namespace lock.
+	registerLockRESTHandlers(router)
+
 }
 
 // List of some generic handlers which are applied for all incoming requests.
 var globalHandlers = []HandlerFunc{
-	// set x-amz-request-id header.
-	addrequestIDHeader,
+	// set x-amz-request-id, x-minio-deployment-id header.
+	addCustomHeaders,
 	// set HTTP security headers such as Content-Security-Policy.
 	addSecurityHeaders,
 	// Forward path style requests to actual host in a bucket federated setup.
 	setBucketForwardingHandler,
-	// Ratelimit the incoming requests using a token bucket algorithm
-	setRateLimitHandler,
-	// Validate all the incoming paths.
-	setPathValidityHandler,
+	// Validate all the incoming requests.
+	setRequestValidityHandler,
 	// Network statistics
 	setHTTPStatsHandler,
 	// Limits all requests size to a maximum fixed limit
@@ -82,6 +81,8 @@ var globalHandlers = []HandlerFunc{
 	// routes them accordingly. Client receives a HTTP error for
 	// invalid/unsupported signatures.
 	setAuthHandler,
+	// Enforce rules specific for TLS requests
+	setSSETLSHandler,
 	// filters HTTP headers which are treated as metadata and are reserved
 	// for internal use only.
 	filterReservedMetadata,
@@ -99,14 +100,11 @@ func configureServerHandler(endpoints EndpointList) (http.Handler, error) {
 		registerDistXLRouters(router, endpoints)
 	}
 
-	// Add STS router only enabled if etcd is configured.
+	// Add STS router always.
 	registerSTSRouter(router)
 
-	// Add Admin RPC router
-	registerAdminRPCRouter(router)
-
-	// Add Admin router.
-	registerAdminRouter(router)
+	// Add Admin router, all APIs are enabled in server mode.
+	registerAdminRouter(router, true, true)
 
 	// Add healthcheck router
 	registerHealthCheckRouter(router)
@@ -121,8 +119,8 @@ func configureServerHandler(endpoints EndpointList) (http.Handler, error) {
 		}
 	}
 
-	// Add API router.
-	registerAPIRouter(router)
+	// Add API router, additionally all server mode support encryption.
+	registerAPIRouter(router, true)
 
 	// Register rest of the handlers.
 	return registerHandlers(router, globalHandlers...), nil

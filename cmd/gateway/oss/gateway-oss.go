@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017, 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,11 +26,13 @@ import (
 	"strings"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
-	"github.com/dustin/go-humanize"
+	humanize "github.com/dustin/go-humanize"
 
 	"github.com/minio/cli"
 	miniogopolicy "github.com/minio/minio-go/pkg/policy"
+	"github.com/minio/minio-go/pkg/s3utils"
 	minio "github.com/minio/minio/cmd"
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/hash"
@@ -67,7 +69,7 @@ ENVIRONMENT VARIABLES:
      MINIO_BROWSER: To disable web browser access, set this value to "off".
 
   DOMAIN:
-     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to Minio host domain name.
+     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to MinIO host domain name.
 
   CACHE:
      MINIO_CACHE_DRIVES: List of mounted drives or directories delimited by ";".
@@ -98,7 +100,7 @@ EXAMPLES:
 
 	minio.RegisterGatewayCommand(cli.Command{
 		Name:               "oss",
-		Usage:              "Alibaba Cloud (Aliyun) Object Storage Service (OSS).",
+		Usage:              "Alibaba Cloud (Aliyun) Object Storage Service (OSS)",
 		Action:             ossGatewayMain,
 		CustomHelpTemplate: ossGatewayTemplate,
 		HideHelpCommand:    true,
@@ -180,7 +182,7 @@ func appendS3MetaToOSSOptions(ctx context.Context, opts []oss.Option, s3Metadata
 		case k == "X-Amz-Acl":
 			// Valid values: public-read, private, and public-read-write
 			opts = append(opts, oss.ObjectACL(oss.ACLType(v)))
-		case k == "X-Amz-Server-Side​-Encryption":
+		case k == "X-Amz-Server-Side-Encryption":
 			opts = append(opts, oss.ServerSideEncryption(v))
 		case k == "X-Amz-Copy-Source-If-Match":
 			opts = append(opts, oss.CopySourceIfMatch(v))
@@ -348,7 +350,7 @@ func ossIsValidBucketName(bucket string) bool {
 	if strings.Contains(bucket, ".") {
 		return false
 	}
-	if !minio.IsValidBucketName(bucket) {
+	if s3utils.CheckValidBucketNameStrict(bucket) != nil {
 		return false
 	}
 	return true
@@ -568,7 +570,7 @@ func (l *ossObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	// Setup cleanup function to cause the above go-routine to
 	// exit in case of partial read
 	pipeCloser := func() { pr.Close() }
-	return minio.NewGetObjectReaderFromReader(pr, objInfo, pipeCloser), nil
+	return minio.NewGetObjectReaderFromReader(pr, objInfo, opts.CheckCopyPrecondFn, pipeCloser)
 }
 
 // GetObject reads an object on OSS. Supports additional
@@ -655,12 +657,17 @@ func ossPutObject(ctx context.Context, client *oss.Client, bucket, object string
 }
 
 // PutObject creates a new object with the incoming data.
-func (l *ossObjects) PutObject(ctx context.Context, bucket, object string, data *hash.Reader, metadata map[string]string, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
-	return ossPutObject(ctx, l.Client, bucket, object, data, metadata)
+func (l *ossObjects) PutObject(ctx context.Context, bucket, object string, r *minio.PutObjReader, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
+	data := r.Reader
+
+	return ossPutObject(ctx, l.Client, bucket, object, data, opts.UserDefined)
 }
 
 // CopyObject copies an object from source bucket to a destination bucket.
 func (l *ossObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
+	if srcOpts.CheckCopyPrecondFn != nil && srcOpts.CheckCopyPrecondFn(srcInfo, "") {
+		return minio.ObjectInfo{}, minio.PreConditionFailed{}
+	}
 	bkt, err := l.Client.Bucket(srcBucket)
 	if err != nil {
 		logger.LogIf(ctx, err)
@@ -750,7 +757,7 @@ func (l *ossObjects) ListMultipartUploads(ctx context.Context, bucket, prefix, k
 }
 
 // NewMultipartUpload upload object in multiple parts.
-func (l *ossObjects) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string, o minio.ObjectOptions) (uploadID string, err error) {
+func (l *ossObjects) NewMultipartUpload(ctx context.Context, bucket, object string, o minio.ObjectOptions) (uploadID string, err error) {
 	bkt, err := l.Client.Bucket(bucket)
 	if err != nil {
 		logger.LogIf(ctx, err)
@@ -758,7 +765,7 @@ func (l *ossObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 	}
 
 	// Build OSS metadata
-	opts, err := appendS3MetaToOSSOptions(ctx, nil, metadata)
+	opts, err := appendS3MetaToOSSOptions(ctx, nil, o.UserDefined)
 	if err != nil {
 		return uploadID, ossToObjectError(err, bucket, object)
 	}
@@ -773,7 +780,8 @@ func (l *ossObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 }
 
 // PutObjectPart puts a part of object in bucket.
-func (l *ossObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *hash.Reader, opts minio.ObjectOptions) (pi minio.PartInfo, err error) {
+func (l *ossObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, r *minio.PutObjReader, opts minio.ObjectOptions) (pi minio.PartInfo, err error) {
+	data := r.Reader
 	bkt, err := l.Client.Bucket(bucket)
 	if err != nil {
 		logger.LogIf(ctx, err)
@@ -841,7 +849,7 @@ func ossListObjectParts(client *oss.Client, bucket, object, uploadID string, par
 	}
 
 	// always drain output (response body)
-	defer minio.CloseResponse(resp.Body)
+	defer xhttp.DrainBody(resp.Body)
 
 	err = xml.NewDecoder(resp.Body).Decode(&lupr)
 	if err != nil {
@@ -883,7 +891,7 @@ func (l *ossObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, d
 }
 
 // ListObjectParts returns all object parts for specified object in specified bucket
-func (l *ossObjects) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int) (lpi minio.ListPartsInfo, err error) {
+func (l *ossObjects) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int, opts minio.ObjectOptions) (lpi minio.ListPartsInfo, err error) {
 	lupr, err := ossListObjectParts(l.Client, bucket, object, uploadID, partNumberMarker, maxParts)
 	if err != nil {
 		logger.LogIf(ctx, err)
@@ -914,7 +922,7 @@ func (l *ossObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 }
 
 // CompleteMultipartUpload completes ongoing multipart upload and finalizes object.
-func (l *ossObjects) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []minio.CompletePart) (oi minio.ObjectInfo, err error) {
+func (l *ossObjects) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []minio.CompletePart, opts minio.ObjectOptions) (oi minio.ObjectInfo, err error) {
 	client := l.Client
 	bkt, err := client.Bucket(bucket)
 	if err != nil {

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,24 +20,27 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	jwtgo "github.com/dgrijalva/jwt-go"
 )
 
 const (
-	// Minimum length for Minio access key.
+	// Minimum length for MinIO access key.
 	accessKeyMinLen = 3
 
-	// Maximum length for Minio access key.
+	// Maximum length for MinIO access key.
 	// There is no max length enforcement for access keys
 	accessKeyMaxLen = 20
 
-	// Minimum length for Minio secret key for both server and gateway mode.
+	// Minimum length for MinIO secret key for both server and gateway mode.
 	secretKeyMinLen = 8
 
-	// Maximum secret key length for Minio, this
+	// Maximum secret key length for MinIO, this
 	// is used when autogenerating new credentials.
 	// There is no max length enforcement for secret keys
 	secretKeyMaxLen = 40
@@ -60,8 +63,8 @@ func IsAccessKeyValid(accessKey string) bool {
 	return len(accessKey) >= accessKeyMinLen
 }
 
-// isSecretKeyValid - validate secret key for right length.
-func isSecretKeyValid(secretKey string) bool {
+// IsSecretKeyValid - validate secret key for right length.
+func IsSecretKeyValid(secretKey string) bool {
 	return len(secretKey) >= secretKeyMinLen
 }
 
@@ -87,7 +90,7 @@ func (cred Credentials) IsExpired() bool {
 func (cred Credentials) IsValid() bool {
 	// Verify credentials if its enabled or not set.
 	if cred.Status == "enabled" || cred.Status == "" {
-		return IsAccessKeyValid(cred.AccessKey) && isSecretKeyValid(cred.SecretKey) && !cred.IsExpired()
+		return IsAccessKeyValid(cred.AccessKey) && IsSecretKeyValid(cred.SecretKey) && !cred.IsExpired()
 	}
 	return false
 }
@@ -102,6 +105,27 @@ func (cred Credentials) Equal(ccred Credentials) bool {
 }
 
 var timeSentinel = time.Unix(0, 0).UTC()
+
+func expToInt64(expI interface{}) (expAt int64, err error) {
+	switch exp := expI.(type) {
+	case float64:
+		expAt = int64(exp)
+	case int64:
+		expAt = exp
+	case json.Number:
+		expAt, err = exp.Int64()
+		if err != nil {
+			return 0, err
+		}
+	case time.Duration:
+		return time.Now().UTC().Add(exp).Unix(), nil
+	case nil:
+		return 0, nil
+	default:
+		return 0, errors.New("invalid expiry value")
+	}
+	return expAt, nil
+}
 
 // GetNewCredentialsWithMetadata generates and returns new credential with expiry.
 func GetNewCredentialsWithMetadata(m map[string]interface{}, tokenSecret string) (cred Credentials, err error) {
@@ -131,11 +155,14 @@ func GetNewCredentialsWithMetadata(m map[string]interface{}, tokenSecret string)
 	if err != nil {
 		return cred, err
 	}
-	cred.SecretKey = string([]byte(base64.URLEncoding.EncodeToString(keyBytes))[:secretKeyMaxLen])
+	cred.SecretKey = strings.Replace(string([]byte(base64.StdEncoding.EncodeToString(keyBytes))[:secretKeyMaxLen]), "/", "+", -1)
 	cred.Status = "enabled"
 
-	expiry, ok := m["exp"].(float64)
-	if !ok {
+	expiry, err := expToInt64(m["exp"])
+	if err != nil {
+		return cred, err
+	}
+	if expiry == 0 {
 		cred.Expiration = timeSentinel
 		return cred, nil
 	}
@@ -143,7 +170,7 @@ func GetNewCredentialsWithMetadata(m map[string]interface{}, tokenSecret string)
 	m["accessKey"] = cred.AccessKey
 	jwt := jwtgo.NewWithClaims(jwtgo.SigningMethodHS512, jwtgo.MapClaims(m))
 
-	cred.Expiration = time.Unix(int64(expiry), 0)
+	cred.Expiration = time.Unix(expiry, 0)
 	cred.SessionToken, err = jwt.SignedString([]byte(tokenSecret))
 	if err != nil {
 		return cred, err
@@ -163,7 +190,7 @@ func CreateCredentials(accessKey, secretKey string) (cred Credentials, err error
 	if !IsAccessKeyValid(accessKey) {
 		return cred, ErrInvalidAccessKeyLength
 	}
-	if !isSecretKeyValid(secretKey) {
+	if !IsSecretKeyValid(secretKey) {
 		return cred, ErrInvalidSecretKeyLength
 	}
 	cred.AccessKey = accessKey

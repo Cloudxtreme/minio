@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,8 +34,8 @@ import (
 
 // JWKSArgs - RSA authentication target arguments
 type JWKSArgs struct {
-	URL       *xnet.URL `json:"url"`
-	publicKey crypto.PublicKey
+	URL        *xnet.URL `json:"url"`
+	publicKeys map[string]crypto.PublicKey
 }
 
 // Validate JWT authentication target arguments
@@ -64,9 +64,14 @@ func (r *JWKSArgs) PopulatePublicKey() error {
 		return err
 	}
 
-	r.publicKey, err = jwk.Keys[0].DecodePublicKey()
-	if err != nil {
-		return err
+	r.publicKeys = make(map[string]crypto.PublicKey)
+	for _, key := range jwk.Keys {
+		var publicKey crypto.PublicKey
+		publicKey, err = key.DecodePublicKey()
+		if err != nil {
+			return err
+		}
+		r.publicKeys[key.Kid] = publicKey
 	}
 
 	return nil
@@ -125,23 +130,24 @@ func expToInt64(expI interface{}) (expAt int64, err error) {
 			return 0, err
 		}
 	default:
-		return 0, errors.New("invalid expiry value")
+		return 0, ErrInvalidDuration
 	}
 	return expAt, nil
 }
 
-func getDefaultExpiration(dsecs string) (time.Duration, error) {
+// GetDefaultExpiration - returns the expiration seconds expected.
+func GetDefaultExpiration(dsecs string) (time.Duration, error) {
 	defaultExpiryDuration := time.Duration(60) * time.Minute // Defaults to 1hr.
 	if dsecs != "" {
 		expirySecs, err := strconv.ParseInt(dsecs, 10, 64)
 		if err != nil {
-			return 0, err
+			return 0, ErrInvalidDuration
 		}
 		// The duration, in seconds, of the role session.
 		// The value can range from 900 seconds (15 minutes)
 		// to 12 hours.
 		if expirySecs < 900 || expirySecs > 43200 {
-			return 0, errors.New("out of range value for duration in seconds")
+			return 0, ErrInvalidDuration
 		}
 
 		defaultExpiryDuration = time.Duration(expirySecs) * time.Second
@@ -172,24 +178,31 @@ func newCustomHTTPTransport(insecure bool) *http.Transport {
 
 // Validate - validates the access token.
 func (p *JWT) Validate(token, dsecs string) (map[string]interface{}, error) {
+	jp := new(jwtgo.Parser)
+	jp.ValidMethods = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+
 	keyFuncCallback := func(jwtToken *jwtgo.Token) (interface{}, error) {
-		if _, ok := jwtToken.Method.(*jwtgo.SigningMethodRSA); !ok {
-			if _, ok = jwtToken.Method.(*jwtgo.SigningMethodECDSA); ok {
-				return p.args.publicKey, nil
-			}
-			return nil, fmt.Errorf("Unexpected signing method: %v", jwtToken.Header["alg"])
+		kid, ok := jwtToken.Header["kid"].(string)
+		if !ok {
+			return nil, fmt.Errorf("Invalid kid value %v", jwtToken.Header["kid"])
 		}
-		return p.args.publicKey, nil
+		return p.args.publicKeys[kid], nil
 	}
 
 	var claims jwtgo.MapClaims
-	jwtToken, err := jwtgo.ParseWithClaims(token, &claims, keyFuncCallback)
+	jwtToken, err := jp.ParseWithClaims(token, &claims, keyFuncCallback)
 	if err != nil {
-		return nil, err
+		if err = p.args.PopulatePublicKey(); err != nil {
+			return nil, err
+		}
+		jwtToken, err = jwtgo.ParseWithClaims(token, &claims, keyFuncCallback)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if !jwtToken.Valid {
-		return nil, fmt.Errorf("Invalid token: %v", token)
+		return nil, ErrTokenExpired
 	}
 
 	expAt, err := expToInt64(claims["exp"])
@@ -197,7 +210,7 @@ func (p *JWT) Validate(token, dsecs string) (map[string]interface{}, error) {
 		return nil, err
 	}
 
-	defaultExpiryDuration, err := getDefaultExpiration(dsecs)
+	defaultExpiryDuration, err := GetDefaultExpiration(dsecs)
 	if err != nil {
 		return nil, err
 	}

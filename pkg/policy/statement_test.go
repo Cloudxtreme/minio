@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -305,11 +305,11 @@ func TestStatementMarshalJSON(t *testing.T) {
 	case3Statement := NewStatement(
 		Deny,
 		NewPrincipal("*"),
-		NewActionSet(GetObjectAction),
+		NewActionSet(PutObjectAction),
 		NewResourceSet(NewResource("mybucket", "/myobject*")),
 		condition.NewFunctions(func2),
 	)
-	case3Data := []byte(`{"Effect":"Deny","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::mybucket/myobject*"],"Condition":{"Null":{"s3:x-amz-server-side-encryption":[false]}}}`)
+	case3Data := []byte(`{"Effect":"Deny","Principal":{"AWS":["*"]},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::mybucket/myobject*"],"Condition":{"Null":{"s3:x-amz-server-side-encryption":[false]}}}`)
 
 	case4Statement := NewStatement(
 		Allow,

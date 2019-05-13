@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -111,9 +111,8 @@ func TestOSSToObjectError(t *testing.T) {
 
 func TestS3MetaToOSSOptions(t *testing.T) {
 	var err error
-	var headers map[string]string
 
-	headers = map[string]string{
+	headers := map[string]string{
 		"x-amz-meta-invalid_meta": "value",
 	}
 	_, err = appendS3MetaToOSSOptions(context.Background(), nil, headers)

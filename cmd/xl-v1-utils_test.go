@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -174,7 +174,7 @@ func (m *xlMetaV1) AddTestObjectCheckSum(checkSumNum int, name string, algorithm
 
 // AddTestObjectPart - add a new object part in order.
 func (m *xlMetaV1) AddTestObjectPart(partNumber int, partName string, partETag string, partSize int64) {
-	partInfo := objectPartInfo{
+	partInfo := ObjectPartInfo{
 		Number: partNumber,
 		Name:   partName,
 		ETag:   partETag,
@@ -201,7 +201,7 @@ func getSampleXLMeta(totalParts int) xlMetaV1 {
 	// Number of checksum info == total parts.
 	xlMeta.Erasure.Checksums = make([]ChecksumInfo, totalParts)
 	// total number of parts.
-	xlMeta.Parts = make([]objectPartInfo, totalParts)
+	xlMeta.Parts = make([]ObjectPartInfo, totalParts)
 	for i := 0; i < totalParts; i++ {
 		partName := "part." + strconv.Itoa(i+1)
 		// hard coding hash and algo value for the checksum, Since we are benchmarking the parsing of xl.json the magnitude doesn't affect the test,

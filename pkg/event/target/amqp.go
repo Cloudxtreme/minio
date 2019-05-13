@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/minio/minio/pkg/event"
 	xnet "github.com/minio/minio/pkg/net"
@@ -106,8 +107,12 @@ func (target *AMQPTarget) channel() (*amqp.Channel, error) {
 	return ch, nil
 }
 
-// Send - sends event to AMQP.
-func (target *AMQPTarget) Send(eventData event.Event) error {
+// Save - Sends event directly without persisting.
+func (target *AMQPTarget) Save(eventData event.Event) error {
+	return target.send(eventData)
+}
+
+func (target *AMQPTarget) send(eventData event.Event) error {
 	ch, err := target.channel()
 	if err != nil {
 		return err
@@ -123,7 +128,7 @@ func (target *AMQPTarget) Send(eventData event.Event) error {
 	}
 	key := eventData.S3.Bucket.Name + "/" + objectName
 
-	data, err := json.Marshal(event.Log{eventData.EventName, key, []event.Event{eventData}})
+	data, err := json.Marshal(event.Log{EventName: eventData.EventName, Key: key, Records: []event.Event{eventData}})
 	if err != nil {
 		return err
 	}
@@ -141,6 +146,11 @@ func (target *AMQPTarget) Send(eventData event.Event) error {
 		})
 }
 
+// Send - interface compatible method does no-op.
+func (target *AMQPTarget) Send(eventKey string) error {
+	return nil
+}
+
 // Close - does nothing and available for interface compatibility.
 func (target *AMQPTarget) Close() error {
 	return nil
@@ -148,13 +158,22 @@ func (target *AMQPTarget) Close() error {
 
 // NewAMQPTarget - creates new AMQP target.
 func NewAMQPTarget(id string, args AMQPArgs) (*AMQPTarget, error) {
-	conn, err := amqp.Dial(args.URL.String())
-	if err != nil {
-		return nil, err
+	var conn *amqp.Connection
+	var err error
+	// Retry 5 times with time interval of 2 seconds.
+	for i := 1; i <= 5; i++ {
+		conn, err = amqp.Dial(args.URL.String())
+		if err == nil {
+			break
+		}
+		if err != nil && i == 5 {
+			return nil, err
+		}
+		time.Sleep(2 * time.Second)
 	}
 
 	return &AMQPTarget{
-		id:   event.TargetID{id, "amqp"},
+		id:   event.TargetID{ID: id, Name: "amqp"},
 		args: args,
 		conn: conn,
 	}, nil

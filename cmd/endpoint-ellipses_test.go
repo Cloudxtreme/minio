@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,7 +44,6 @@ func TestCreateServerEndpoints(t *testing.T) {
 		{":9000", []string{"/export1{1...32}", "/export1{1...32}"}, false},
 		// Same host cannot export same disk on two ports - special case localhost.
 		{":9001", []string{"http://localhost:900{1...2}/export{1...64}"}, false},
-
 		// Valid inputs.
 		{":9000", []string{"/export1"}, true},
 		{":9000", []string{"/export1", "/export2", "/export3", "/export4"}, true},
@@ -226,6 +225,17 @@ func TestGetSetIndexes(t *testing.T) {
 	}
 }
 
+func getHexSequences(start int, number int, paddinglen int) (seq []string) {
+	for i := start; i <= number; i++ {
+		if paddinglen == 0 {
+			seq = append(seq, fmt.Sprintf("%x", i))
+		} else {
+			seq = append(seq, fmt.Sprintf(fmt.Sprintf("%%0%dx", paddinglen), i))
+		}
+	}
+	return seq
+}
+
 func getSequences(start int, number int, paddinglen int) (seq []string) {
 	for i := start; i <= number; i++ {
 		if paddinglen == 0 {
@@ -287,9 +297,9 @@ func TestParseEndpointSet(t *testing.T) {
 				[]ellipses.ArgPattern{
 					[]ellipses.Pattern{
 						{
-							"/export/set",
-							"",
-							getSequences(1, 64, 0),
+							Prefix: "/export/set",
+							Suffix: "",
+							Seq:    getSequences(1, 64, 0),
 						},
 					},
 				},
@@ -305,14 +315,14 @@ func TestParseEndpointSet(t *testing.T) {
 				[]ellipses.ArgPattern{
 					[]ellipses.Pattern{
 						{
-							"",
-							"",
-							getSequences(1, 64, 0),
+							Prefix: "",
+							Suffix: "",
+							Seq:    getSequences(1, 64, 0),
 						},
 						{
-							"http://minio",
-							"/export/set",
-							getSequences(2, 3, 0),
+							Prefix: "http://minio",
+							Suffix: "/export/set",
+							Seq:    getSequences(2, 3, 0),
 						},
 					},
 				},
@@ -328,9 +338,9 @@ func TestParseEndpointSet(t *testing.T) {
 				[]ellipses.ArgPattern{
 					[]ellipses.Pattern{
 						{
-							"http://minio",
-							".mydomain.net/data",
-							getSequences(1, 64, 0),
+							Prefix: "http://minio",
+							Suffix: ".mydomain.net/data",
+							Seq:    getSequences(1, 64, 0),
 						},
 					},
 				},
@@ -345,14 +355,14 @@ func TestParseEndpointSet(t *testing.T) {
 				[]ellipses.ArgPattern{
 					[]ellipses.Pattern{
 						{
-							"",
-							"/data",
-							getSequences(1, 16, 0),
+							Prefix: "",
+							Suffix: "/data",
+							Seq:    getSequences(1, 16, 0),
 						},
 						{
-							"http://rack",
-							".mydomain.minio",
-							getSequences(1, 4, 0),
+							Prefix: "http://rack",
+							Suffix: ".mydomain.minio",
+							Seq:    getSequences(1, 4, 0),
 						},
 					},
 				},
@@ -368,14 +378,14 @@ func TestParseEndpointSet(t *testing.T) {
 				[]ellipses.ArgPattern{
 					[]ellipses.Pattern{
 						{
-							"",
-							"",
-							getSequences(0, 1, 0),
+							Prefix: "",
+							Suffix: "",
+							Seq:    getSequences(0, 1, 0),
 						},
 						{
-							"http://minio",
-							".mydomain.net/data",
-							getSequences(0, 15, 0),
+							Prefix: "http://minio",
+							Suffix: ".mydomain.net/data",
+							Seq:    getSequences(0, 15, 0),
 						},
 					},
 				},
@@ -391,9 +401,9 @@ func TestParseEndpointSet(t *testing.T) {
 				[]ellipses.ArgPattern{
 					[]ellipses.Pattern{
 						{
-							"http://server1/data",
-							"",
-							getSequences(1, 32, 0),
+							Prefix: "http://server1/data",
+							Suffix: "",
+							Seq:    getSequences(1, 32, 0),
 						},
 					},
 				},
@@ -409,9 +419,9 @@ func TestParseEndpointSet(t *testing.T) {
 				[]ellipses.ArgPattern{
 					[]ellipses.Pattern{
 						{
-							"http://server1/data",
-							"",
-							getSequences(1, 32, 2),
+							Prefix: "http://server1/data",
+							Suffix: "",
+							Seq:    getSequences(1, 32, 2),
 						},
 					},
 				},
@@ -427,19 +437,19 @@ func TestParseEndpointSet(t *testing.T) {
 				[]ellipses.ArgPattern{
 					[]ellipses.Pattern{
 						{
-							"",
-							"",
-							getSequences(1, 2, 0),
+							Prefix: "",
+							Suffix: "",
+							Seq:    getSequences(1, 2, 0),
 						},
 						{
-							"",
-							"/test",
-							getSequences(1, 64, 0),
+							Prefix: "",
+							Suffix: "/test",
+							Seq:    getSequences(1, 64, 0),
 						},
 						{
-							"http://minio",
-							"/export/set",
-							getSequences(2, 3, 0),
+							Prefix: "http://minio",
+							Suffix: "/export/set",
+							Seq:    getSequences(2, 3, 0),
 						},
 					},
 				},
@@ -456,14 +466,60 @@ func TestParseEndpointSet(t *testing.T) {
 				[]ellipses.ArgPattern{
 					[]ellipses.Pattern{
 						{
-							"",
-							"",
-							getSequences(1, 10, 0),
+							Prefix: "",
+							Suffix: "",
+							Seq:    getSequences(1, 10, 0),
 						},
 						{
-							"/export",
-							"/disk",
-							getSequences(1, 10, 0),
+							Prefix: "/export",
+							Suffix: "/disk",
+							Seq:    getSequences(1, 10, 0),
+						},
+					},
+				},
+				nil,
+				[][]uint64{{10, 10, 10, 10, 10, 10, 10, 10, 10, 10}},
+			},
+			true,
+		},
+		// IPv6 ellipses with hexadecimal expansion
+		{
+			"http://[2001:3984:3989::{1...a}]/disk{1...10}",
+			endpointSet{
+				[]ellipses.ArgPattern{
+					[]ellipses.Pattern{
+						{
+							Prefix: "",
+							Suffix: "",
+							Seq:    getSequences(1, 10, 0),
+						},
+						{
+							Prefix: "http://[2001:3984:3989::",
+							Suffix: "]/disk",
+							Seq:    getHexSequences(1, 10, 0),
+						},
+					},
+				},
+				nil,
+				[][]uint64{{10, 10, 10, 10, 10, 10, 10, 10, 10, 10}},
+			},
+			true,
+		},
+		// IPv6 ellipses with hexadecimal expansion with 3 position numerics.
+		{
+			"http://[2001:3984:3989::{001...00a}]/disk{1...10}",
+			endpointSet{
+				[]ellipses.ArgPattern{
+					[]ellipses.Pattern{
+						{
+							Prefix: "",
+							Suffix: "",
+							Seq:    getSequences(1, 10, 0),
+						},
+						{
+							Prefix: "http://[2001:3984:3989::",
+							Suffix: "]/disk",
+							Seq:    getHexSequences(1, 10, 3),
 						},
 					},
 				},

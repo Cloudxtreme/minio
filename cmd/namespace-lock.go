@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017, 2018, 2019 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ import (
 var globalNSMutex *nsLockMap
 
 // Global lock server one per server.
-var globalLockServer *lockRPCReceiver
+var globalLockServer *lockRESTServer
 
 // Instance of dsync for distributed clients.
 var globalDsync *dsync.Dsync
@@ -48,14 +48,6 @@ type RWLocker interface {
 	GetLock(timeout *dynamicTimeout) (timedOutErr error)
 	Unlock()
 	GetRLock(timeout *dynamicTimeout) (timedOutErr error)
-	RUnlock()
-}
-
-// RWLockerSync - internal locker interface.
-type RWLockerSync interface {
-	GetLock(timeout time.Duration) bool
-	Unlock()
-	GetRLock(timeout time.Duration) bool
 	RUnlock()
 }
 
@@ -74,7 +66,7 @@ func newDsyncNodes(endpoints EndpointList) (clnts []dsync.NetLocker, myNode int)
 		if endpoint.IsLocal {
 			myNode = len(clnts)
 
-			receiver := &lockRPCReceiver{
+			receiver := &lockRESTServer{
 				ll: localLocker{
 					serverAddr:      endpoint.Host,
 					serviceEndpoint: lockServicePath,
@@ -87,8 +79,7 @@ func newDsyncNodes(endpoints EndpointList) (clnts []dsync.NetLocker, myNode int)
 		} else {
 			host, err := xnet.ParseHost(endpoint.Host)
 			logger.FatalIf(err, "Unable to parse Lock RPC Host")
-			locker, err = NewLockRPCClient(host)
-			logger.FatalIf(err, "Unable to initialize Lock RPC Client")
+			locker = newlockRESTClient(host)
 		}
 
 		clnts = append(clnts, locker)
@@ -101,9 +92,11 @@ func newDsyncNodes(endpoints EndpointList) (clnts []dsync.NetLocker, myNode int)
 func newNSLock(isDistXL bool) *nsLockMap {
 	nsMutex := nsLockMap{
 		isDistXL: isDistXL,
-		lockMap:  make(map[nsParam]*nsLock),
-		counters: &lockStat{},
 	}
+	if isDistXL {
+		return &nsMutex
+	}
+	nsMutex.lockMap = make(map[nsParam]*nsLock)
 	return &nsMutex
 }
 
@@ -120,16 +113,13 @@ type nsParam struct {
 
 // nsLock - provides primitives for locking critical namespace regions.
 type nsLock struct {
-	RWLockerSync
+	*lsync.LRWMutex
 	ref uint
 }
 
 // nsLockMap - namespace lock map, provides primitives to Lock,
 // Unlock, RLock and RUnlock.
 type nsLockMap struct {
-	// Lock counter used for lock debugging.
-	counters *lockStat
-
 	// Indicates if namespace is part of a distributed setup.
 	isDistXL     bool
 	lockMap      map[nsParam]*nsLock
@@ -145,13 +135,8 @@ func (n *nsLockMap) lock(volume, path string, lockSource, opsID string, readLock
 	nsLk, found := n.lockMap[param]
 	if !found {
 		n.lockMap[param] = &nsLock{
-			RWLockerSync: func() RWLockerSync {
-				if n.isDistXL {
-					return dsync.NewDRWMutex(pathJoin(volume, path), globalDsync)
-				}
-				return &lsync.LRWMutex{}
-			}(),
-			ref: 1,
+			LRWMutex: &lsync.LRWMutex{},
+			ref:      1,
 		}
 		nsLk = n.lockMap[param]
 	} else {
@@ -162,9 +147,9 @@ func (n *nsLockMap) lock(volume, path string, lockSource, opsID string, readLock
 
 	// Locking here will block (until timeout).
 	if readLock {
-		locked = nsLk.GetRLock(timeout)
+		locked = nsLk.GetRLock(opsID, lockSource, timeout)
 	} else {
-		locked = nsLk.GetLock(timeout)
+		locked = nsLk.GetLock(opsID, lockSource, timeout)
 	}
 
 	if !locked { // We failed to get the lock
@@ -259,15 +244,53 @@ func (n *nsLockMap) ForceUnlock(volume, path string) {
 		dsync.NewDRWMutex(pathJoin(volume, path), globalDsync).ForceUnlock()
 	}
 
-	param := nsParam{volume, path}
-	if _, found := n.lockMap[param]; found {
-		// Remove lock from the map.
-		delete(n.lockMap, param)
-	}
+	// Remove lock from the map.
+	delete(n.lockMap, nsParam{volume, path})
 }
 
-// lockInstance - frontend/top-level interface for namespace locks.
-type lockInstance struct {
+// dsync's distributed lock instance.
+type distLockInstance struct {
+	rwMutex             *dsync.DRWMutex
+	volume, path, opsID string
+}
+
+// Lock - block until write lock is taken or timeout has occurred.
+func (di *distLockInstance) GetLock(timeout *dynamicTimeout) (timedOutErr error) {
+	lockSource := getSource()
+	start := UTCNow()
+
+	if !di.rwMutex.GetLock(di.opsID, lockSource, timeout.Timeout()) {
+		timeout.LogFailure()
+		return OperationTimedOut{Path: di.path}
+	}
+	timeout.LogSuccess(UTCNow().Sub(start))
+	return nil
+}
+
+// Unlock - block until write lock is released.
+func (di *distLockInstance) Unlock() {
+	di.rwMutex.Unlock()
+}
+
+// RLock - block until read lock is taken or timeout has occurred.
+func (di *distLockInstance) GetRLock(timeout *dynamicTimeout) (timedOutErr error) {
+	lockSource := getSource()
+	start := UTCNow()
+	if !di.rwMutex.GetRLock(di.opsID, lockSource, timeout.Timeout()) {
+		timeout.LogFailure()
+		return OperationTimedOut{Path: di.path}
+	}
+	timeout.LogSuccess(UTCNow().Sub(start))
+	return nil
+}
+
+// RUnlock - block until read lock is released.
+func (di *distLockInstance) RUnlock() {
+	di.rwMutex.RUnlock()
+}
+
+// localLockInstance - frontend/top-level interface for namespace locks.
+type localLockInstance struct {
 	ns                  *nsLockMap
 	volume, path, opsID string
 }
@@ -277,11 +300,14 @@ type lockInstance struct {
 // volume, path and operation ID.
 func (n *nsLockMap) NewNSLock(volume, path string) RWLocker {
 	opsID := mustGetUUID()
-	return &lockInstance{n, volume, path, opsID}
+	if n.isDistXL {
+		return &distLockInstance{dsync.NewDRWMutex(pathJoin(volume, path), globalDsync), volume, path, opsID}
+	}
+	return &localLockInstance{n, volume, path, opsID}
 }
 
 // Lock - block until write lock is taken or timeout has occurred.
-func (li *lockInstance) GetLock(timeout *dynamicTimeout) (timedOutErr error) {
+func (li *localLockInstance) GetLock(timeout *dynamicTimeout) (timedOutErr error) {
 	lockSource := getSource()
 	start := UTCNow()
 	readLock := false
@@ -294,13 +320,13 @@ func (li *lockInstance) GetLock(timeout *dynamicTimeout) (timedOutErr error) {
 }
 
 // Unlock - block until write lock is released.
-func (li *lockInstance) Unlock() {
+func (li *localLockInstance) Unlock() {
 	readLock := false
 	li.ns.unlock(li.volume, li.path, li.opsID, readLock)
 }
 
 // RLock - block until read lock is taken or timeout has occurred.
-func (li *lockInstance) GetRLock(timeout *dynamicTimeout) (timedOutErr error) {
+func (li *localLockInstance) GetRLock(timeout *dynamicTimeout) (timedOutErr error) {
 	lockSource := getSource()
 	start := UTCNow()
 	readLock := true
@@ -313,7 +339,7 @@ func (li *lockInstance) GetRLock(timeout *dynamicTimeout) (timedOutErr error) {
 }
 
 // RUnlock - block until read lock is released.
-func (li *lockInstance) RUnlock() {
+func (li *localLockInstance) RUnlock() {
 	readLock := true
 	li.ns.unlock(li.volume, li.path, li.opsID, readLock)
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -77,7 +77,8 @@ func init() {
 	// Set system resources to maximum.
 	setMaxResources()
 
-	logger.Disable = true
+	// Uncomment the following line to see trace logs during unit tests.
+	// logger.AddTarget(console.New())
 }
 
 // concurreny level for certain parallel tests.
@@ -136,12 +137,12 @@ func calculateSignedChunkLength(chunkDataSize int64) int64 {
 		2 // CRLF
 }
 
-func mustGetHashReader(t TestErrHandler, data io.Reader, size int64, md5hex, sha256hex string) *hash.Reader {
-	hr, err := hash.NewReader(data, size, md5hex, sha256hex, size)
+func mustGetPutObjReader(t TestErrHandler, data io.Reader, size int64, md5hex, sha256hex string) *PutObjReader {
+	hr, err := hash.NewReader(data, size, md5hex, sha256hex, size, globalCLIContext.StrictS3Compat)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return hr
+	return NewPutObjReader(hr, nil, nil)
 }
 
 // calculateSignedChunkLength - calculates the length of the overall stream (data + metadata)
@@ -294,7 +295,7 @@ func isSameType(obj1, obj2 interface{}) bool {
 	return reflect.TypeOf(obj1) == reflect.TypeOf(obj2)
 }
 
-// TestServer encapsulates an instantiation of a Minio instance with a temporary backend.
+// TestServer encapsulates an instantiation of a MinIO instance with a temporary backend.
 // Example usage:
 //   s := StartTestServer(t,"XL")
 //   defer s.Stop()
@@ -305,7 +306,6 @@ type TestServer struct {
 	SecretKey string
 	Server    *httptest.Server
 	Obj       ObjectLayer
-	endpoints EndpointList
 }
 
 // UnstartedTestServer - Configures a temp FS/XL backend,
@@ -404,7 +404,23 @@ func StartTestServer(t TestErrHandler, instanceType string) TestServer {
 
 // Sets the global config path to empty string.
 func resetGlobalConfigPath() {
-	setConfigDir("")
+	globalConfigDir = &ConfigDir{path: ""}
+}
+
+func resetGlobalServiceDoneCh() {
+	// Repeatedly send on the service done channel, so that
+	// listening go-routines will quit. This works better than
+	// closing the channel - closing introduces a new race, as the
+	// current thread writes to the variable, and other threads
+	// listening on it, read from it.
+loop:
+	for {
+		select {
+		case GlobalServiceDoneCh <- struct{}{}:
+		default:
+			break loop
+		}
+	}
 }
 
 // sets globalObjectAPI to `nil`.
@@ -471,9 +487,17 @@ func resetGlobalCacheObjectAPI() {
 	globalCacheObjectAPI = nil
 }
 
+// sets globalIAMSys to `nil`.
+func resetGlobalIAMSys() {
+	globalIAMSys = nil
+}
+
 // Resets all the globals used modified in tests.
 // Resetting ensures that the changes made to globals by one test doesn't affect others.
 func resetTestGlobals() {
+	// close any indefinitely running go-routines from previous
+	// tests.
+	resetGlobalServiceDoneCh()
 	// set globalObjectAPI to `nil`.
 	resetGlobalObjectAPI()
 	// Reset config path set.
@@ -494,8 +518,10 @@ func resetTestGlobals() {
 	resetGlobalHealState()
 	//Reset global disk cache flags
 	resetGlobalCacheEnvs()
-	//set globalCacheObjectAPI to nil
+	// Reset globalCacheObjectAPI to nil
 	resetGlobalCacheObjectAPI()
+	// Reset globalIAMSys to `nil`
+	resetGlobalIAMSys()
 }
 
 // Configure the server for the test run.
@@ -673,7 +699,7 @@ func signStreamingRequest(req *http.Request, accessKey, secretKey string, currTi
 	scope := strings.Join([]string{
 		currTime.Format(yyyymmdd),
 		globalMinioDefaultRegion,
-		"s3",
+		string(serviceS3),
 		"aws4_request",
 	}, "/")
 
@@ -683,7 +709,7 @@ func signStreamingRequest(req *http.Request, accessKey, secretKey string, currTi
 
 	date := sumHMAC([]byte("AWS4"+secretKey), []byte(currTime.Format(yyyymmdd)))
 	region := sumHMAC(date, []byte(globalMinioDefaultRegion))
-	service := sumHMAC(region, []byte("s3"))
+	service := sumHMAC(region, []byte(string(serviceS3)))
 	signingKey := sumHMAC(service, []byte("aws4_request"))
 
 	signature := hex.EncodeToString(sumHMAC(signingKey, []byte(stringToSign)))
@@ -753,7 +779,7 @@ func assembleStreamingChunks(req *http.Request, body io.ReadSeeker, chunkSize in
 		scope := strings.Join([]string{
 			currTime.Format(yyyymmdd),
 			regionStr,
-			"s3",
+			string(serviceS3),
 			"aws4_request",
 		}, "/")
 
@@ -766,7 +792,7 @@ func assembleStreamingChunks(req *http.Request, body io.ReadSeeker, chunkSize in
 
 		date := sumHMAC([]byte("AWS4"+secretKey), []byte(currTime.Format(yyyymmdd)))
 		region := sumHMAC(date, []byte(regionStr))
-		service := sumHMAC(region, []byte("s3"))
+		service := sumHMAC(region, []byte(serviceS3))
 		signingKey := sumHMAC(service, []byte("aws4_request"))
 
 		signature = hex.EncodeToString(sumHMAC(signingKey, []byte(stringToSign)))
@@ -867,7 +893,7 @@ func preSignV4(req *http.Request, accessKeyID, secretAccessKey string, expires i
 	queryStr := strings.Replace(query.Encode(), "+", "%20", -1)
 	canonicalRequest := getCanonicalRequest(extractedSignedHeaders, unsignedPayload, queryStr, req.URL.Path, req.Method)
 	stringToSign := getStringToSign(canonicalRequest, date, scope)
-	signingKey := getSigningKey(secretAccessKey, date, region)
+	signingKey := getSigningKey(secretAccessKey, date, region, serviceS3)
 	signature := getSignature(signingKey, stringToSign)
 
 	req.URL.RawQuery = query.Encode()
@@ -941,7 +967,7 @@ func preSignV2(req *http.Request, accessKeyID, secretAccessKey string, expires i
 
 // Sign given request using Signature V2.
 func signRequestV2(req *http.Request, accessKey, secretKey string) error {
-	req = s3signer.SignV2(*req, accessKey, secretKey, false)
+	s3signer.SignV2(*req, accessKey, secretKey, false)
 	return nil
 }
 
@@ -1028,7 +1054,7 @@ func signRequestV4(req *http.Request, accessKey, secretKey string) error {
 	scope := strings.Join([]string{
 		currTime.Format(yyyymmdd),
 		region,
-		"s3",
+		string(serviceS3),
 		"aws4_request",
 	}, "/")
 
@@ -1038,7 +1064,7 @@ func signRequestV4(req *http.Request, accessKey, secretKey string) error {
 
 	date := sumHMAC([]byte("AWS4"+secretKey), []byte(currTime.Format(yyyymmdd)))
 	regionHMAC := sumHMAC(date, []byte(region))
-	service := sumHMAC(regionHMAC, []byte("s3"))
+	service := sumHMAC(regionHMAC, []byte(serviceS3))
 	signingKey := sumHMAC(service, []byte("aws4_request"))
 
 	signature := hex.EncodeToString(sumHMAC(signingKey, []byte(stringToSign)))
@@ -1297,36 +1323,6 @@ func getRandomBucketName() string {
 
 }
 
-// TruncateWriter - Writes `n` bytes, then returns with number of bytes written.
-// differs from iotest.TruncateWriter, the difference is commented in the Write method.
-func TruncateWriter(w io.Writer, n int64) io.Writer {
-	return &truncateWriter{w, n}
-}
-
-type truncateWriter struct {
-	w io.Writer
-	n int64
-}
-
-func (t *truncateWriter) Write(p []byte) (n int, err error) {
-	if t.n <= 0 {
-		return len(p), nil
-	}
-	// real write
-	n = len(p)
-	if int64(n) > t.n {
-		n = int(t.n)
-	}
-	n, err = t.w.Write(p[0:n])
-	t.n -= int64(n)
-	// Removed from iotest.TruncateWriter.
-	// Need the Write method to return truncated number of bytes written, not the size of the buffer requested to be written.
-	// if err == nil {
-	// 	n = len(p)
-	// }
-	return
-}
-
 // NewEOFWriter returns a Writer that writes to w,
 // but returns EOF error after writing n bytes.
 func NewEOFWriter(w io.Writer, n int64) io.Writer {
@@ -1481,16 +1477,19 @@ func getBucketLocationURL(endPoint, bucketName string) string {
 }
 
 // return URL for listing objects in the bucket with V1 legacy API.
-func getListObjectsV1URL(endPoint, bucketName string, maxKeys string) string {
+func getListObjectsV1URL(endPoint, bucketName, prefix, maxKeys, encodingType string) string {
 	queryValue := url.Values{}
 	if maxKeys != "" {
 		queryValue.Set("max-keys", maxKeys)
 	}
-	return makeTestTargetURL(endPoint, bucketName, "", queryValue)
+	if encodingType != "" {
+		queryValue.Set("encoding-type", encodingType)
+	}
+	return makeTestTargetURL(endPoint, bucketName, prefix, queryValue)
 }
 
 // return URL for listing objects in the bucket with V2 API.
-func getListObjectsV2URL(endPoint, bucketName string, maxKeys string, fetchOwner string) string {
+func getListObjectsV2URL(endPoint, bucketName, prefix, maxKeys, fetchOwner, encodingType string) string {
 	queryValue := url.Values{}
 	queryValue.Set("list-type", "2") // Enables list objects V2 URL.
 	if maxKeys != "" {
@@ -1499,7 +1498,10 @@ func getListObjectsV2URL(endPoint, bucketName string, maxKeys string, fetchOwner
 	if fetchOwner != "" {
 		queryValue.Set("fetch-owner", fetchOwner)
 	}
-	return makeTestTargetURL(endPoint, bucketName, "", queryValue)
+	if encodingType != "" {
+		queryValue.Set("encoding-type", encodingType)
+	}
+	return makeTestTargetURL(endPoint, bucketName, prefix, queryValue)
 }
 
 // return URL for a new multipart upload.
@@ -1612,7 +1614,7 @@ func newTestObjectLayer(endpoints EndpointList) (newObject ObjectLayer, err erro
 	}
 
 	// Initialize list pool.
-	listPool := newTreeWalkPool(globalLookupTimeout)
+	listPool := NewTreeWalkPool(globalLookupTimeout)
 
 	// Initialize xl objects.
 	xl := &xlObjects{
@@ -1688,11 +1690,10 @@ func initAPIHandlerTest(obj ObjectLayer, endpoints []string) (string, http.Handl
 	// Register the API end points with XL object layer.
 	// Registering only the GetObject handler.
 	apiRouter := initTestAPIEndPoints(obj, endpoints)
-	var f http.HandlerFunc
-	f = func(w http.ResponseWriter, r *http.Request) {
+	f := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.RequestURI = r.URL.RequestURI()
 		apiRouter.ServeHTTP(w, r)
-	}
+	})
 	return bucketName, f, nil
 }
 
@@ -1737,7 +1738,7 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 	// simple function which returns a message which gives the context of the test
 	// and then followed by the the actual error message.
 	failTestStr := func(testType, failMsg string) string {
-		return fmt.Sprintf("Minio %s: %s fail for \"%s\": \n<Error> %s", instanceType, testType, testName, failMsg)
+		return fmt.Sprintf("MinIO %s: %s fail for \"%s\": \n<Error> %s", instanceType, testType, testName, failMsg)
 	}
 
 	// httptest Recorder to capture all the response by the http handler.
@@ -1765,9 +1766,6 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 		t.Fatal(failTestStr(anonTestStr, fmt.Sprintf("Object API Nil Test expected to fail with %d, but failed with %d", accesDeniedHTTPStatus, rec.Code)))
 	}
 
-	// expected error response in bytes when objectLayer is not initialized, or set to `nil`.
-	expectedErrResponse := encodeResponse(getAPIErrorResponse(getAPIError(ErrAccessDenied), getGetObjectURL("", bucketName, objectName), ""))
-
 	// HEAD HTTTP request doesn't contain response body.
 	if anonReq.Method != "HEAD" {
 		// read the response body.
@@ -1776,9 +1774,18 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 		if err != nil {
 			t.Fatal(failTestStr(anonTestStr, fmt.Sprintf("Failed parsing response body: <ERROR> %v", err)))
 		}
-		// verify whether actual error response (from the response body), matches the expected error response.
-		if !bytes.Equal(expectedErrResponse, actualContent) {
-			t.Fatal(failTestStr(anonTestStr, "error response content differs from expected value"))
+
+		actualError := &APIErrorResponse{}
+		if err = xml.Unmarshal(actualContent, actualError); err != nil {
+			t.Fatal(failTestStr(anonTestStr, "error response failed to parse error XML"))
+		}
+
+		if actualError.BucketName != bucketName {
+			t.Fatal(failTestStr(anonTestStr, "error response bucket name differs from expected value"))
+		}
+
+		if actualError.Key != objectName {
+			t.Fatal(failTestStr(anonTestStr, "error response object name differs from expected value"))
 		}
 	}
 
@@ -1828,11 +1835,18 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 		if err != nil {
 			t.Fatal(failTestStr(unknownSignTestStr, fmt.Sprintf("Failed parsing response body: <ERROR> %v", err)))
 		}
-		// verify whether actual error response (from the response body), matches the expected error response.
-		if !bytes.Equal(expectedErrResponse, actualContent) {
-			fmt.Println(string(expectedErrResponse))
-			fmt.Println(string(actualContent))
-			t.Fatal(failTestStr(unknownSignTestStr, "error response content differs from expected value"))
+
+		actualError := &APIErrorResponse{}
+		if err = xml.Unmarshal(actualContent, actualError); err != nil {
+			t.Fatal(failTestStr(unknownSignTestStr, "error response failed to parse error XML"))
+		}
+
+		if actualError.BucketName != bucketName {
+			t.Fatal(failTestStr(unknownSignTestStr, "error response bucket name differs from expected value"))
+		}
+
+		if actualError.Key != objectName {
+			t.Fatal(failTestStr(unknownSignTestStr, "error response object name differs from expected value"))
 		}
 	}
 
@@ -1867,9 +1881,6 @@ func ExecObjectLayerAPINilTest(t TestErrHandler, bucketName, objectName, instanc
 	if rec.Code != serverNotInitializedErr {
 		t.Errorf("Object API Nil Test expected to fail with %d, but failed with %d", serverNotInitializedErr, rec.Code)
 	}
-	// expected error response in bytes when objectLayer is not initialized, or set to `nil`.
-	expectedErrResponse := encodeResponse(getAPIErrorResponse(getAPIError(ErrServerNotInitialized),
-		getGetObjectURL("", bucketName, objectName), ""))
 
 	// HEAD HTTP Request doesn't contain body in its response,
 	// for other type of HTTP requests compare the response body content with the expected one.
@@ -1877,11 +1888,20 @@ func ExecObjectLayerAPINilTest(t TestErrHandler, bucketName, objectName, instanc
 		// read the response body.
 		actualContent, err := ioutil.ReadAll(rec.Body)
 		if err != nil {
-			t.Fatalf("Minio %s: Failed parsing response body: <ERROR> %v", instanceType, err)
+			t.Fatalf("MinIO %s: Failed parsing response body: <ERROR> %v", instanceType, err)
 		}
-		// verify whether actual error response (from the response body), matches the expected error response.
-		if !bytes.Equal(expectedErrResponse, actualContent) {
-			t.Errorf("Minio %s: Object content differs from expected value", instanceType)
+
+		actualError := &APIErrorResponse{}
+		if err = xml.Unmarshal(actualContent, actualError); err != nil {
+			t.Errorf("MinIO %s: error response failed to parse error XML", instanceType)
+		}
+
+		if actualError.BucketName != bucketName {
+			t.Errorf("MinIO %s: error response bucket name differs from expected value", instanceType)
+		}
+
+		if actualError.Key != objectName {
+			t.Errorf("MinIO %s: error response object name differs from expected value", instanceType)
 		}
 	}
 }
@@ -1902,9 +1922,11 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 	}
 	bucketFS, fsAPIRouter, err := initAPIHandlerTest(objLayer, endpoints)
 	if err != nil {
-		t.Fatalf("Initialzation of API handler tests failed: <ERROR> %s", err)
+		t.Fatalf("Initialization of API handler tests failed: <ERROR> %s", err)
 	}
 
+	globalIAMSys = NewIAMSys()
+	globalIAMSys.Init(objLayer)
 	// initialize the server and obtain the credentials and root.
 	// credentials are necessary to sign the HTTP request.
 	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
@@ -2106,7 +2128,7 @@ func registerBucketLevelFunc(bucket *mux.Router, api objectAPIHandlers, apiFunct
 func registerAPIFunctions(muxRouter *mux.Router, objLayer ObjectLayer, apiFunctions ...string) {
 	if len(apiFunctions) == 0 {
 		// Register all api endpoints by default.
-		registerAPIRouter(muxRouter)
+		registerAPIRouter(muxRouter, true)
 		return
 	}
 	// API Router.
@@ -2124,8 +2146,9 @@ func registerAPIFunctions(muxRouter *mux.Router, objLayer ObjectLayer, apiFuncti
 	// to underlying cache layer to manage object layer operation and disk caching
 	// operation
 	api := objectAPIHandlers{
-		ObjectAPI: newObjectLayerFn,
-		CacheAPI:  newCacheObjectsFn,
+		ObjectAPI:         newObjectLayerFn,
+		CacheAPI:          newCacheObjectsFn,
+		EncryptionEnabled: func() bool { return true },
 	}
 
 	// Register ListBuckets	handler.
@@ -2146,7 +2169,7 @@ func initTestAPIEndPoints(objLayer ObjectLayer, apiFunctions []string) http.Hand
 		registerAPIFunctions(muxRouter, objLayer, apiFunctions...)
 		return muxRouter
 	}
-	registerAPIRouter(muxRouter)
+	registerAPIRouter(muxRouter, true)
 	return muxRouter
 }
 
@@ -2160,40 +2183,6 @@ func initTestWebRPCEndPoint(objLayer ObjectLayer) http.Handler {
 	muxRouter := mux.NewRouter().SkipClean(true)
 	registerWebRouter(muxRouter)
 	return muxRouter
-}
-
-func StartTestS3PeerRPCServer(t TestErrHandler) (TestServer, []string) {
-	// init disks
-	objLayer, fsDirs, err := prepareXL16()
-	if err != nil {
-		t.Fatalf("%s", err)
-	}
-
-	// Create an instance of TestServer.
-	testRPCServer := TestServer{}
-
-	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
-		t.Fatalf("%s", err)
-	}
-
-	// Fetch credentials for the test server.
-	credentials := globalServerConfig.GetCredential()
-	testRPCServer.AccessKey = credentials.AccessKey
-	testRPCServer.SecretKey = credentials.SecretKey
-
-	// set object layer
-	testRPCServer.Obj = objLayer
-	globalObjLayerMutex.Lock()
-	globalObjectAPI = objLayer
-	globalObjLayerMutex.Unlock()
-
-	// Register router on a new mux
-	muxRouter := mux.NewRouter().SkipClean(true)
-	registerPeerRPCRouter(muxRouter)
-
-	// Initialize and run the TestServer.
-	testRPCServer.Server = httptest.NewServer(muxRouter)
-	return testRPCServer, fsDirs
 }
 
 // generateTLSCertKey creates valid key/cert with registered DNS or IP address
@@ -2310,7 +2299,7 @@ func getEndpointsLocalAddr(endpoints EndpointList) string {
 		}
 	}
 
-	return globalMinioHost + ":" + globalMinioPort
+	return net.JoinHostPort(globalMinioHost, globalMinioPort)
 }
 
 // fetches a random number between range min-max.
@@ -2345,8 +2334,9 @@ func TestToErrIsNil(t *testing.T) {
 	if toStorageErr(nil) != nil {
 		t.Errorf("Test expected to return nil, failed instead got a non-nil value %s", toStorageErr(nil))
 	}
-	if toAPIErrorCode(nil) != ErrNone {
-		t.Errorf("Test expected error code to be ErrNone, failed instead provided %d", toAPIErrorCode(nil))
+	ctx := context.Background()
+	if toAPIError(ctx, nil) != noError {
+		t.Errorf("Test expected error code to be ErrNone, failed instead provided %s", toAPIError(ctx, nil).Code)
 	}
 }
 
@@ -2423,7 +2413,7 @@ func uploadTestObject(t *testing.T, apiRouter http.Handler, creds auth.Credentia
 			rec = httptest.NewRecorder()
 			apiRouter.ServeHTTP(rec, req)
 			checkRespErr(rec, http.StatusOK)
-			etag := rec.Header().Get("ETag")
+			etag := rec.Header()["ETag"][0]
 			if etag == "" {
 				t.Fatalf("Unexpected empty etag")
 			}

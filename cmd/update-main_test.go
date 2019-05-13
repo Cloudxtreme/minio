@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -82,13 +83,19 @@ func TestReleaseTagToNFromTimeConversion(t *testing.T) {
 func TestDownloadURL(t *testing.T) {
 	minioVersion1 := releaseTimeToReleaseTag(UTCNow())
 	durl := getDownloadURL(minioVersion1)
-	if runtime.GOOS == "windows" {
-		if durl != minioReleaseURL+"minio.exe" {
-			t.Errorf("Expected %s, got %s", minioReleaseURL+"minio.exe", durl)
+	if IsDocker() {
+		if durl != "docker pull minio/minio:"+minioVersion1 {
+			t.Errorf("Expected %s, got %s", "docker pull minio/minio:"+minioVersion1, durl)
 		}
 	} else {
-		if durl != minioReleaseURL+"minio" {
-			t.Errorf("Expected %s, got %s", minioReleaseURL+"minio", durl)
+		if runtime.GOOS == "windows" {
+			if durl != minioReleaseURL+"minio.exe" {
+				t.Errorf("Expected %s, got %s", minioReleaseURL+"minio.exe", durl)
+			}
+		} else {
+			if durl != minioReleaseURL+"minio" {
+				t.Errorf("Expected %s, got %s", minioReleaseURL+"minio", durl)
+			}
 		}
 	}
 
@@ -119,19 +126,19 @@ func TestUserAgent(t *testing.T) {
 			envName:     "",
 			envValue:    "",
 			mode:        globalMinioModeFS,
-			expectedStr: fmt.Sprintf("Minio (%s; %s; %s; source) Minio/DEVELOPMENT.GOGET Minio/DEVELOPMENT.GOGET Minio/DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeFS),
+			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeFS),
 		},
 		{
 			envName:     "MESOS_CONTAINER_NAME",
 			envValue:    "mesos-11111",
 			mode:        globalMinioModeXL,
-			expectedStr: fmt.Sprintf("Minio (%s; %s; %s; %s; source) Minio/DEVELOPMENT.GOGET Minio/DEVELOPMENT.GOGET Minio/DEVELOPMENT.GOGET Minio/universe-%s", runtime.GOOS, runtime.GOARCH, globalMinioModeXL, "dcos", "mesos-1111"),
+			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/universe-%s", runtime.GOOS, runtime.GOARCH, globalMinioModeXL, "dcos", "mesos-1111"),
 		},
 		{
 			envName:     "KUBERNETES_SERVICE_HOST",
 			envValue:    "10.11.148.5",
 			mode:        globalMinioModeXL,
-			expectedStr: fmt.Sprintf("Minio (%s; %s; %s; %s; source) Minio/DEVELOPMENT.GOGET Minio/DEVELOPMENT.GOGET Minio/DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeXL, "kubernetes"),
+			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source) MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET MinIO/DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeXL, "kubernetes"),
 		},
 	}
 
@@ -141,8 +148,12 @@ func TestUserAgent(t *testing.T) {
 			os.Setenv("MARATHON_APP_LABEL_DCOS_PACKAGE_VERSION", "mesos-1111")
 		}
 		str := getUserAgent(testCase.mode)
-		if str != testCase.expectedStr {
-			t.Errorf("Test %d: expected: %s, got: %s", i+1, testCase.expectedStr, str)
+		expectedStr := testCase.expectedStr
+		if IsDocker() {
+			expectedStr = strings.Replace(expectedStr, "; source", "; docker; source", -1)
+		}
+		if str != expectedStr {
+			t.Errorf("Test %d: expected: %s, got: %s", i+1, expectedStr, str)
 		}
 		os.Unsetenv("MARATHON_APP_LABEL_DCOS_PACKAGE_VERSION")
 		os.Unsetenv(testCase.envName)

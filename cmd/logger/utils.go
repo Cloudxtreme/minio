@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,25 +33,25 @@ var (
 		return isatty.IsTerminal(os.Stdout.Fd()) && isatty.IsTerminal(os.Stderr.Fd())
 	}
 
-	colorBold = func() func(a ...interface{}) string {
+	ColorBold = func() func(a ...interface{}) string {
 		if isTerminal() {
 			return color.New(color.Bold).SprintFunc()
 		}
 		return fmt.Sprint
 	}()
-	colorFgRed = func() func(format string, a ...interface{}) string {
+	ColorFgRed = func() func(a ...interface{}) string {
 		if isTerminal() {
-			return color.New(color.FgRed).SprintfFunc()
+			return color.New(color.FgRed).SprintFunc()
 		}
-		return fmt.Sprintf
+		return fmt.Sprint
 	}()
-	colorBgRed = func() func(format string, a ...interface{}) string {
+	ColorBgRed = func() func(format string, a ...interface{}) string {
 		if isTerminal() {
 			return color.New(color.BgRed).SprintfFunc()
 		}
 		return fmt.Sprintf
 	}()
-	colorFgWhite = func() func(format string, a ...interface{}) string {
+	ColorFgWhite = func() func(format string, a ...interface{}) string {
 		if isTerminal() {
 			return color.New(color.FgWhite).SprintfFunc()
 		}
@@ -83,17 +83,5 @@ func ansiRestoreAttributes() {
 	if isTerminal() {
 		ansiEscape("8")
 	}
-}
 
-func uniqueEntries(paths []string) []string {
-	found := map[string]bool{}
-	unqiue := []string{}
-
-	for v := range paths {
-		if _, ok := found[paths[v]]; !ok {
-			found[paths[v]] = true
-			unqiue = append(unqiue, paths[v])
-		}
-	}
-	return unqiue
 }

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -223,7 +223,8 @@ func TestGetRootCAs(t *testing.T) {
 		certCAsDir  string
 		expectedErr error
 	}{
-		{"nonexistent-dir", errFileNotFound},
+		// ignores non-existent directories.
+		{"nonexistent-dir", nil},
 		// Ignores directories.
 		{dir1, nil},
 		// Ignore empty directory.

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/minio/minio/pkg/event"
 	xnet "github.com/minio/minio/pkg/net"
@@ -70,8 +69,13 @@ func (target *ElasticsearchTarget) ID() event.TargetID {
 	return target.id
 }
 
-// Send - sends event to Elasticsearch.
-func (target *ElasticsearchTarget) Send(eventData event.Event) (err error) {
+// Save - Sends event directly without persisting.
+func (target *ElasticsearchTarget) Save(eventData event.Event) error {
+	return target.send(eventData)
+}
+
+func (target *ElasticsearchTarget) send(eventData event.Event) error {
+
 	var key string
 
 	remove := func() error {
@@ -85,13 +89,7 @@ func (target *ElasticsearchTarget) Send(eventData event.Event) (err error) {
 	}
 
 	add := func() error {
-		eventTime, err := time.Parse(event.AMZTimeFormat, eventData.EventTime)
-		if err != nil {
-			return err
-		}
-
-		eventTimeMS := fmt.Sprintf("%d", eventTime.UnixNano()/1000000)
-		_, err = target.client.Index().Index(target.args.Index).Type("event").Timestamp(eventTimeMS).BodyJson(map[string]interface{}{"Records": []event.Event{eventData}}).Do(context.Background())
+		_, err := target.client.Index().Index(target.args.Index).Type("event").BodyJson(map[string]interface{}{"Records": []event.Event{eventData}}).Do(context.Background())
 		return err
 	}
 
@@ -115,6 +113,11 @@ func (target *ElasticsearchTarget) Send(eventData event.Event) (err error) {
 		return add()
 	}
 
+	return nil
+}
+
+// Send - interface compatible method does no-op.
+func (target *ElasticsearchTarget) Send(eventKey string) error {
 	return nil
 }
 
@@ -147,7 +150,7 @@ func NewElasticsearchTarget(id string, args ElasticsearchArgs) (*ElasticsearchTa
 	}
 
 	return &ElasticsearchTarget{
-		id:     event.TargetID{id, "elasticsearch"},
+		id:     event.TargetID{ID: id, Name: "elasticsearch"},
 		args:   args,
 		client: client,
 	}, nil

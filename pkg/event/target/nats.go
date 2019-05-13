@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,6 @@ type NATSArgs struct {
 	Streaming    struct {
 		Enable             bool   `json:"enable"`
 		ClusterID          string `json:"clusterID"`
-		ClientID           string `json:"clientID"`
 		Async              bool   `json:"async"`
 		MaxPubAcksInflight int    `json:"maxPubAcksInflight"`
 	} `json:"streaming"`
@@ -64,9 +63,6 @@ func (n NATSArgs) Validate() error {
 		if n.Streaming.ClusterID == "" {
 			return errors.New("empty cluster id")
 		}
-		if n.Streaming.ClientID == "" {
-			return errors.New("empty client id")
-		}
 	}
 
 	return nil
@@ -85,15 +81,19 @@ func (target *NATSTarget) ID() event.TargetID {
 	return target.id
 }
 
-// Send - sends event to NATS.
-func (target *NATSTarget) Send(eventData event.Event) (err error) {
+// Save - Sends event directly without persisting.
+func (target *NATSTarget) Save(eventData event.Event) error {
+	return target.send(eventData)
+}
+
+func (target *NATSTarget) send(eventData event.Event) error {
 	objectName, err := url.QueryUnescape(eventData.S3.Object.Key)
 	if err != nil {
 		return err
 	}
 	key := eventData.S3.Bucket.Name + "/" + objectName
 
-	data, err := json.Marshal(event.Log{eventData.EventName, key, []event.Event{eventData}})
+	data, err := json.Marshal(event.Log{EventName: eventData.EventName, Key: key, Records: []event.Event{eventData}})
 	if err != nil {
 		return err
 	}
@@ -109,6 +109,11 @@ func (target *NATSTarget) Send(eventData event.Event) (err error) {
 	}
 
 	return err
+}
+
+// Send - interface compatible method does no-op.
+func (target *NATSTarget) Send(eventKey string) error {
+	return nil
 }
 
 // Close - closes underneath connections to NATS server.
@@ -128,6 +133,7 @@ func (target *NATSTarget) Close() (err error) {
 func NewNATSTarget(id string, args NATSArgs) (*NATSTarget, error) {
 	var natsConn *nats.Conn
 	var stanConn stan.Conn
+	var clientID string
 	var err error
 
 	if args.Streaming.Enable {
@@ -137,12 +143,9 @@ func NewNATSTarget(id string, args NATSArgs) (*NATSTarget, error) {
 		}
 		addressURL := scheme + "://" + args.Username + ":" + args.Password + "@" + args.Address.String()
 
-		clientID := args.Streaming.ClientID
-		if clientID == "" {
-			clientID, err = getNewUUID()
-			if err != nil {
-				return nil, err
-			}
+		clientID, err = getNewUUID()
+		if err != nil {
+			return nil, err
 		}
 
 		connOpts := []stan.Option{stan.NatsURL(addressURL)}
@@ -165,7 +168,7 @@ func NewNATSTarget(id string, args NATSArgs) (*NATSTarget, error) {
 	}
 
 	return &NATSTarget{
-		id:       event.TargetID{id, "nats"},
+		id:       event.TargetID{ID: id, Name: "nats"},
 		args:     args,
 		stanConn: stanConn,
 		natsConn: natsConn,

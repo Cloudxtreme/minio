@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -134,7 +134,7 @@ func TestCacheExclusion(t *testing.T) {
 		t.Fatal(err)
 	}
 	cobj := cobjects.(*cacheObjects)
-	globalServiceDoneCh <- struct{}{}
+	GlobalServiceDoneCh <- struct{}{}
 	testCases := []struct {
 		bucketName     string
 		objectName     string
@@ -192,14 +192,13 @@ func TestDiskCache(t *testing.T) {
 	objInfo.ContentType = contentType
 	objInfo.ETag = etag
 	objInfo.UserDefined = httpMeta
-	opts := ObjectOptions{}
-
+	var opts ObjectOptions
 	byteReader := bytes.NewReader([]byte(content))
-	hashReader, err := hash.NewReader(byteReader, int64(size), "", "", int64(size))
+	hashReader, err := hash.NewReader(byteReader, int64(size), "", "", int64(size), globalCLIContext.StrictS3Compat)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = cache.Put(ctx, bucketName, objectName, hashReader, httpMeta, opts)
+	err = cache.Put(ctx, bucketName, objectName, NewPutObjReader(hashReader, nil, nil), ObjectOptions{UserDefined: httpMeta})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,17 +269,17 @@ func TestDiskCacheMaxUse(t *testing.T) {
 	opts := ObjectOptions{}
 
 	byteReader := bytes.NewReader([]byte(content))
-	hashReader, err := hash.NewReader(byteReader, int64(size), "", "", int64(size))
+	hashReader, err := hash.NewReader(byteReader, int64(size), "", "", int64(size), globalCLIContext.StrictS3Compat)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !cache.diskAvailable(int64(size)) {
-		err = cache.Put(ctx, bucketName, objectName, hashReader, httpMeta, opts)
+		err = cache.Put(ctx, bucketName, objectName, NewPutObjReader(hashReader, nil, nil), ObjectOptions{UserDefined: httpMeta})
 		if err != errDiskFull {
 			t.Fatal("Cache max-use limit violated.")
 		}
 	} else {
-		err = cache.Put(ctx, bucketName, objectName, hashReader, httpMeta, opts)
+		err = cache.Put(ctx, bucketName, objectName, NewPutObjReader(hashReader, nil, nil), ObjectOptions{UserDefined: httpMeta})
 		if err != nil {
 			t.Fatal(err)
 		}

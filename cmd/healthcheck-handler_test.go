@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ func TestGoroutineCountCheck(t *testing.T) {
 		// Make goroutines -- to make sure number of go-routines is higher than threshold
 		if tt.threshold == 5 || tt.threshold == 6 {
 			for i := 0; i < 6; i++ {
-				go time.Sleep(5)
+				go time.Sleep(5 * time.Nanosecond)
 			}
 		}
 		if err := goroutineCountCheck(tt.threshold); (err != nil) != tt.wantErr {

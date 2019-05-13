@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,22 +20,23 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
-	"net/url"
+	"net"
 	"runtime"
 	"strings"
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/minio/cmd/logger"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
 // Documentation links, these are part of message printing code.
 const (
-	mcQuickStartGuide     = "https://docs.minio.io/docs/minio-client-quickstart-guide"
-	goQuickStartGuide     = "https://docs.minio.io/docs/golang-client-quickstart-guide"
-	jsQuickStartGuide     = "https://docs.minio.io/docs/javascript-client-quickstart-guide"
-	javaQuickStartGuide   = "https://docs.minio.io/docs/java-client-quickstart-guide"
-	pyQuickStartGuide     = "https://docs.minio.io/docs/python-client-quickstart-guide"
-	dotnetQuickStartGuide = "https://docs.minio.io/docs/dotnet-client-quickstart-guide"
+	mcQuickStartGuide     = "https://docs.min.io/docs/minio-client-quickstart-guide"
+	goQuickStartGuide     = "https://docs.min.io/docs/golang-client-quickstart-guide"
+	jsQuickStartGuide     = "https://docs.min.io/docs/javascript-client-quickstart-guide"
+	javaQuickStartGuide   = "https://docs.min.io/docs/java-client-quickstart-guide"
+	pyQuickStartGuide     = "https://docs.min.io/docs/python-client-quickstart-guide"
+	dotnetQuickStartGuide = "https://docs.min.io/docs/dotnet-client-quickstart-guide"
 )
 
 // generates format string depending on the string length and padding.
@@ -76,6 +77,19 @@ func printStartupMessage(apiEndPoints []string) {
 	}
 }
 
+// Returns true if input is not IPv4, false if it is.
+func isNotIPv4(host string) bool {
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		h = host
+	}
+	ip := net.ParseIP(h)
+	ok := ip.To4() != nil // This is always true of IP is IPv4
+
+	// Returns true if input is not IPv4.
+	return !ok
+}
+
 // strip api endpoints list with standard ports such as
 // port "80" and "443" before displaying on the startup
 // banner.  Returns a new list of API endpoints.
@@ -83,23 +97,16 @@ func stripStandardPorts(apiEndpoints []string) (newAPIEndpoints []string) {
 	newAPIEndpoints = make([]string, len(apiEndpoints))
 	// Check all API endpoints for standard ports and strip them.
 	for i, apiEndpoint := range apiEndpoints {
-		url, err := url.Parse(apiEndpoint)
+		u, err := xnet.ParseURL(apiEndpoint)
 		if err != nil {
 			newAPIEndpoints[i] = apiEndpoint
 			continue
 		}
-		host, port := mustSplitHostPort(url.Host)
-		// For standard HTTP(s) ports such as "80" and "443"
-		// apiEndpoints should only be host without port.
-		switch {
-		case url.Scheme == "http" && port == "80":
-			fallthrough
-		case url.Scheme == "https" && port == "443":
-			url.Host = host
-			newAPIEndpoints[i] = url.String()
-		default:
-			newAPIEndpoints[i] = apiEndpoint
+		if globalMinioHost == "" && isNotIPv4(u.Host) {
+			// Skip all non-IPv4 endpoints when we bind to all interfaces.
+			continue
 		}
+		newAPIEndpoints[i] = u.String()
 	}
 	return newAPIEndpoints
 }
@@ -116,10 +123,12 @@ func printServerCommonMsg(apiEndpoints []string) {
 
 	// Colorize the message and print.
 	logger.StartupMessage(colorBlue("Endpoint: ") + colorBold(fmt.Sprintf(getFormatStr(len(apiEndpointStr), 1), apiEndpointStr)))
-	logger.StartupMessage(colorBlue("AccessKey: ") + colorBold(fmt.Sprintf("%s ", cred.AccessKey)))
-	logger.StartupMessage(colorBlue("SecretKey: ") + colorBold(fmt.Sprintf("%s ", cred.SecretKey)))
-	if region != "" {
-		logger.StartupMessage(colorBlue("Region: ") + colorBold(fmt.Sprintf(getFormatStr(len(region), 3), region)))
+	if isTerminal() && !globalCLIContext.Anonymous {
+		logger.StartupMessage(colorBlue("AccessKey: ") + colorBold(fmt.Sprintf("%s ", cred.AccessKey)))
+		logger.StartupMessage(colorBlue("SecretKey: ") + colorBold(fmt.Sprintf("%s ", cred.SecretKey)))
+		if region != "" {
+			logger.StartupMessage(colorBlue("Region: ") + colorBold(fmt.Sprintf(getFormatStr(len(region), 3), region)))
+		}
 	}
 	printEventNotifiers()
 
@@ -151,13 +160,15 @@ func printCLIAccessMsg(endPoint string, alias string) {
 	cred := globalServerConfig.GetCredential()
 
 	// Configure 'mc', following block prints platform specific information for minio client.
-	logger.StartupMessage(colorBlue("\nCommand-line Access: ") + mcQuickStartGuide)
-	if runtime.GOOS == globalWindowsOSName {
-		mcMessage := fmt.Sprintf("$ mc.exe config host add %s %s %s %s", alias, endPoint, cred.AccessKey, cred.SecretKey)
-		logger.StartupMessage(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
-	} else {
-		mcMessage := fmt.Sprintf("$ mc config host add %s %s %s %s", alias, endPoint, cred.AccessKey, cred.SecretKey)
-		logger.StartupMessage(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
+	if isTerminal() {
+		logger.StartupMessage(colorBlue("\nCommand-line Access: ") + mcQuickStartGuide)
+		if runtime.GOOS == globalWindowsOSName {
+			mcMessage := fmt.Sprintf("$ mc.exe config host add %s %s %s %s", alias, endPoint, cred.AccessKey, cred.SecretKey)
+			logger.StartupMessage(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
+		} else {
+			mcMessage := fmt.Sprintf("$ mc config host add %s %s %s %s", alias, endPoint, cred.AccessKey, cred.SecretKey)
+			logger.StartupMessage(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
+		}
 	}
 }
 

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"io"
 	"sync"
 )
 
@@ -110,11 +111,11 @@ func (d *naughtyDisk) DeleteVol(volume string) (err error) {
 	return d.disk.DeleteVol(volume)
 }
 
-func (d *naughtyDisk) ListDir(volume, path string, count int) (entries []string, err error) {
+func (d *naughtyDisk) ListDir(volume, path string, count int, leafFile string) (entries []string, err error) {
 	if err := d.calcError(); err != nil {
 		return []string{}, err
 	}
-	return d.disk.ListDir(volume, path, count)
+	return d.disk.ListDir(volume, path, count, leafFile)
 }
 
 func (d *naughtyDisk) ReadFile(volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (n int64, err error) {
@@ -124,11 +125,18 @@ func (d *naughtyDisk) ReadFile(volume string, path string, offset int64, buf []b
 	return d.disk.ReadFile(volume, path, offset, buf, verifier)
 }
 
-func (d *naughtyDisk) PrepareFile(volume, path string, length int64) error {
+func (d *naughtyDisk) ReadFileStream(volume, path string, offset, length int64) (io.ReadCloser, error) {
+	if err := d.calcError(); err != nil {
+		return nil, err
+	}
+	return d.disk.ReadFileStream(volume, path, offset, length)
+}
+
+func (d *naughtyDisk) CreateFile(volume, path string, size int64, reader io.Reader) error {
 	if err := d.calcError(); err != nil {
 		return err
 	}
-	return d.disk.PrepareFile(volume, path, length)
+	return d.disk.CreateFile(volume, path, size, reader)
 }
 
 func (d *naughtyDisk) AppendFile(volume, path string, buf []byte) error {
@@ -157,6 +165,13 @@ func (d *naughtyDisk) DeleteFile(volume string, path string) (err error) {
 		return err
 	}
 	return d.disk.DeleteFile(volume, path)
+}
+
+func (d *naughtyDisk) WriteAll(volume string, path string, buf []byte) (err error) {
+	if err := d.calcError(); err != nil {
+		return err
+	}
+	return d.disk.WriteAll(volume, path, buf)
 }
 
 func (d *naughtyDisk) ReadAll(volume string, path string) (buf []byte, err error) {

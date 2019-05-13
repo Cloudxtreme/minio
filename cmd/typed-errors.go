@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2015, 2016 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ var errServerTimeMismatch = errors.New("Server times are too far apart")
 // errOperationTimedOut
 var errOperationTimedOut = errors.New("Operation timed out")
 
-// errInvalidBucketName - bucket name is reserved for Minio, usually
+// errInvalidBucketName - bucket name is reserved for MinIO, usually
 // returned for 'minio', '.minio.sys', buckets with capital letters.
 var errInvalidBucketName = errors.New("The specified bucket is not valid")
 
@@ -76,3 +76,15 @@ var errBucketAlreadyExists = errors.New("Your previous request to create the nam
 
 // error returned for a negative actual size.
 var errInvalidDecompressedSize = errors.New("Invalid Decompressed Size")
+
+// error returned in IAM subsystem when user doesn't exist.
+var errNoSuchUser = errors.New("Specified user does not exist")
+
+// error returned in IAM subsystem when policy doesn't exist.
+var errNoSuchPolicy = errors.New("Specified canned policy does not exist")
+
+// error returned when access is denied.
+var errAccessDenied = errors.New("Do not have enough permissions to access this resource")
+
+// errNetworkConnReset - connection reset by peer
+var errNetworkConnReset = errors.New("connection reset by peer")

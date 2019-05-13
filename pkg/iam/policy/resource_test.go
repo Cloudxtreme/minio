@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -124,7 +124,7 @@ func TestResourceMatch(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		result := testCase.resource.Match(testCase.objectName)
+		result := testCase.resource.Match(testCase.objectName, nil)
 
 		if result != testCase.expectedResult {
 			t.Fatalf("case %v: expected: %v, got: %v", i+1, testCase.expectedResult, result)

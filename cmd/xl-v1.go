@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017, 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,7 +48,7 @@ type xlObjects struct {
 	storageDisks []StorageAPI
 
 	// TODO: ListObjects pool management, should be removed in future.
-	listPool *treeWalkPool
+	listPool *TreeWalkPool
 }
 
 // Shutdown function for object storage interface.
@@ -120,27 +120,22 @@ func getStorageInfo(disks []StorageAPI) StorageInfo {
 		return StorageInfo{}
 	}
 
+	// Combine all disks to get total usage
+	var used, total, available uint64
+	for _, di := range validDisksInfo {
+		used = used + di.Used
+		total = total + di.Total
+		available = available + di.Free
+	}
+
 	_, sscParity := getRedundancyCount(standardStorageClass, len(disks))
 	_, rrscparity := getRedundancyCount(reducedRedundancyStorageClass, len(disks))
 
-	// Total number of online data drives available
-	// This is the number of drives we report free and total space for
-	availableDataDisks := uint64(onlineDisks - sscParity)
-
-	// Available data disks can be zero when onlineDisks is equal to parity,
-	// at that point we simply choose online disks to calculate the size.
-	if availableDataDisks == 0 {
-		availableDataDisks = uint64(onlineDisks)
+	storageInfo := StorageInfo{
+		Used:      used,
+		Total:     total,
+		Available: available,
 	}
-
-	storageInfo := StorageInfo{}
-
-	// Combine all disks to get total usage.
-	var used uint64
-	for _, di := range validDisksInfo {
-		used = used + di.Used
-	}
-	storageInfo.Used = used
 
 	storageInfo.Backend.Type = BackendErasure
 	storageInfo.Backend.OnlineDisks = onlineDisks

@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,9 @@ const (
 
 	// DistXLSetupType - Distributed XL setup type enum.
 	DistXLSetupType
+
+	// GatewaySetupType - gateway setup type enum.
+	GatewaySetupType
 )
 
 func (setupType SetupType) String() string {
@@ -38,6 +41,8 @@ func (setupType SetupType) String() string {
 		return globalMinioModeXL
 	case DistXLSetupType:
 		return globalMinioModeDistXL
+	case GatewaySetupType:
+		return globalMinioModeGatewayPrefix
 	}
 
 	return ""

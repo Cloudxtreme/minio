@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage (C) 2018 Minio, Inc.
+ * MinIO Cloud Storage (C) 2018 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -67,7 +67,7 @@ export class ObjectActions extends React.Component {
             className="fiad-action"
             onClick={this.shareObject.bind(this)}
           >
-            <i className="fa fa-copy" />
+            <i className="fa fa-share-alt" />
           </a>
           <a
             href=""

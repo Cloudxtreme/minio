@@ -1,4 +1,4 @@
-// Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
+// MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -139,4 +139,38 @@ func (key ObjectKey) DerivePartKey(id uint32) (partKey [32]byte) {
 	mac.Write(bin[:])
 	mac.Sum(partKey[:0])
 	return partKey
+}
+
+// SealETag seals the etag using the object key.
+// It does not encrypt empty ETags because such ETags indicate
+// that the S3 client hasn't sent an ETag = MD5(object) and
+// the backend can pick an ETag value.
+func (key ObjectKey) SealETag(etag []byte) []byte {
+	if len(etag) == 0 { // don't encrypt empty ETag - only if client sent ETag = MD5(object)
+		return etag
+	}
+	var buffer bytes.Buffer
+	mac := hmac.New(sha256.New, key[:])
+	mac.Write([]byte("SSE-etag"))
+	if _, err := sio.Encrypt(&buffer, bytes.NewReader(etag), sio.Config{Key: mac.Sum(nil)}); err != nil {
+		logger.CriticalIf(context.Background(), errors.New("Unable to encrypt ETag using object key"))
+	}
+	return buffer.Bytes()
+}
+
+// UnsealETag unseals the etag using the provided object key.
+// It does not try to decrypt the ETag if len(etag) == 16
+// because such ETags indicate that the S3 client hasn't sent
+// an ETag = MD5(object) and the backend has picked an ETag value.
+func (key ObjectKey) UnsealETag(etag []byte) ([]byte, error) {
+	if !IsETagSealed(etag) {
+		return etag, nil
+	}
+	var buffer bytes.Buffer
+	mac := hmac.New(sha256.New, key[:])
+	mac.Write([]byte("SSE-etag"))
+	if _, err := sio.Decrypt(&buffer, bytes.NewReader(etag), sio.Config{Key: mac.Sum(nil)}); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
 }

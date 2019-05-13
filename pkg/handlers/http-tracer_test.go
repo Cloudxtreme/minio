@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -142,13 +142,13 @@ Test-Header: TestHeaderValue
 				status, testCase.expectedStatus)
 		}
 
-		matched, err := regexp.MatchString(testCase.expectedLogRegexp, string(logOutput.Bytes()))
+		matched, err := regexp.MatchString(testCase.expectedLogRegexp, logOutput.String())
 		if err != nil {
 			t.Fatalf("Test %d: Incorrect regexp: %v", i+1, err)
 		}
 
 		if !matched {
-			t.Fatalf("Test %d: Unexpected log content, found: `%s`", i+1, string(logOutput.Bytes()))
+			t.Fatalf("Test %d: Unexpected log content, found: `%s`", i+1, logOutput.String())
 		}
 	}
 }

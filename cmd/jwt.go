@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * MinIO Cloud Storage, (C) 2016, 2017 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,7 +49,33 @@ var (
 	errNoAuthToken          = errors.New("JWT token missing")
 )
 
-func authenticateJWT(accessKey, secretKey string, expiry time.Duration) (string, error) {
+func authenticateJWTUsers(accessKey, secretKey string, expiry time.Duration) (string, error) {
+	passedCredential, err := auth.CreateCredentials(accessKey, secretKey)
+	if err != nil {
+		return "", err
+	}
+
+	serverCred := globalServerConfig.GetCredential()
+	if serverCred.AccessKey != passedCredential.AccessKey {
+		var ok bool
+		serverCred, ok = globalIAMSys.GetUser(accessKey)
+		if !ok {
+			return "", errInvalidAccessKeyID
+		}
+	}
+
+	if !serverCred.Equal(passedCredential) {
+		return "", errAuthentication
+	}
+
+	jwt := jwtgo.NewWithClaims(jwtgo.SigningMethodHS512, jwtgo.StandardClaims{
+		ExpiresAt: UTCNow().Add(expiry).Unix(),
+		Subject:   accessKey,
+	})
+	return jwt.SignedString([]byte(serverCred.SecretKey))
+}
+
+func authenticateJWTAdmin(accessKey, secretKey string, expiry time.Duration) (string, error) {
 	passedCredential, err := auth.CreateCredentials(accessKey, secretKey)
 	if err != nil {
 		return "", err
@@ -73,43 +99,15 @@ func authenticateJWT(accessKey, secretKey string, expiry time.Duration) (string,
 }
 
 func authenticateNode(accessKey, secretKey string) (string, error) {
-	return authenticateJWT(accessKey, secretKey, defaultInterNodeJWTExpiry)
+	return authenticateJWTAdmin(accessKey, secretKey, defaultInterNodeJWTExpiry)
 }
 
 func authenticateWeb(accessKey, secretKey string) (string, error) {
-	return authenticateJWT(accessKey, secretKey, defaultJWTExpiry)
+	return authenticateJWTUsers(accessKey, secretKey, defaultJWTExpiry)
 }
 
 func authenticateURL(accessKey, secretKey string) (string, error) {
-	return authenticateJWT(accessKey, secretKey, defaultURLJWTExpiry)
-}
-
-func stsTokenCallback(jwtToken *jwtgo.Token) (interface{}, error) {
-	if _, ok := jwtToken.Method.(*jwtgo.SigningMethodHMAC); !ok {
-		return nil, fmt.Errorf("Unexpected signing method: %v", jwtToken.Header["alg"])
-	}
-
-	if err := jwtToken.Claims.Valid(); err != nil {
-		return nil, errAuthentication
-	}
-	if claims, ok := jwtToken.Claims.(jwtgo.MapClaims); ok {
-		accessKey, ok := claims["accessKey"].(string)
-		if !ok {
-			return nil, errInvalidAccessKeyID
-		}
-		if accessKey == globalServerConfig.GetCredential().AccessKey {
-			return []byte(globalServerConfig.GetCredential().SecretKey), nil
-		}
-		if globalIAMSys == nil {
-			return nil, errInvalidAccessKeyID
-		}
-		_, ok = globalIAMSys.GetUser(accessKey)
-		if !ok {
-			return nil, errInvalidAccessKeyID
-		}
-		return []byte(globalServerConfig.GetCredential().SecretKey), nil
-	}
-	return nil, errAuthentication
+	return authenticateJWTUsers(accessKey, secretKey, defaultURLJWTExpiry)
 }
 
 // Callback function used for parsing
@@ -177,11 +175,6 @@ func webTokenAuthenticate(token string) (jwtgo.StandardClaims, bool, error) {
 	}
 	owner := claims.Subject == globalServerConfig.GetCredential().AccessKey
 	return claims, owner, nil
-}
-
-func isHTTPRequestValid(req *http.Request) bool {
-	_, _, err := webRequestAuthenticate(req)
-	return err == nil
 }
 
 // Check if the request is authenticated.
